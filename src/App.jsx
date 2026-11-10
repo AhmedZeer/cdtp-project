@@ -7,8 +7,12 @@ import TestManager from './components/TestManager';
 import PlaceholderVision from './components/PlaceholderVision';
 import MarkerPlayground from './components/MarkerPlayground';
 import Simulator3D from './components/Simulator3D';
+import PhoneCameraSender from './components/PhoneCameraSender';
 
 export default function App() {
+  if (new URLSearchParams(window.location.search).get('scene') === 'phone') {
+    return <PhoneCameraSender />;
+  }
   if (new URLSearchParams(window.location.search).get('scene') === 'sim3d') {
     return <Simulator3D />;
   }

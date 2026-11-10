@@ -3,6 +3,7 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import basicSsl from '@vitejs/plugin-basic-ssl';
 import tailwindcss from '@tailwindcss/vite';
+import phoneCameraPlugin from './server/phoneCameraPlugin.js';
 
 export default defineConfig({
   publicDir: 'static',
@@ -10,6 +11,7 @@ export default defineConfig({
     react(),
     tailwindcss(),
     basicSsl(),
+    phoneCameraPlugin(),
   ],
   server: {
     host: '0.0.0.0',

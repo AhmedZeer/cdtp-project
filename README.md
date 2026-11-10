@@ -87,20 +87,32 @@ to misread small or oblique markers, and refining first fixes that. Each cell is
 read from its central 4×4 of the 8×8 warped pixels, away from blurred cell edges. It is
 the detector option `refine: true`; the live camera page does not use it yet.
 
-### Phone camera debugging placeholder
+### Phone camera streaming and mock fallback
 
-Below the simulator's drive controls, **Phone camera preview** copies the rendered
-camera into a 640×360 mock preview, capped at 10 frames per second. It shows the
-source resolution, measured preview rate and copied-frame count. **Pause preview**
-holds the last frame; **Resume preview** continues without pausing the simulator.
-The panel is labelled **Mock · debug only**, and the phone link remains **Not
-connected**.
+1. Run `npm run dev` on the laptop and open `https://localhost:5173/?scene=sim3d`.
+2. Below the drive controls, find **Phone camera preview** and **Copy phone link**.
+   The link uses the laptop's LAN address, with a pairing room unique to this preview.
+3. Open that link on a phone on the same Wi-Fi. Accept or trust the laptop's local
+   HTTPS certificate, tap **Start camera**, and allow camera access.
+4. The phone's rear-camera video streams to the laptop over WebRTC. The preview
+   automatically switches to **Live phone video**. **Stop camera** on the phone or
+   close its page to return to **Mock · simulator frames**. Connecting again switches
+   back to phone video. The phone can also start first and wait for the laptop.
 
-The intended integration is phone video streamed to the laptop. To replace this
-placeholder, the remaining work is:
+The preview preserves the video's aspect ratio within 640×360 and copies up to 10
+frames per second. Diagnostics show connection status, actual source resolution,
+preview rate and frame count. **Pause preview** holds the displayed frame while the
+connection and simulator keep running; **Resume preview** refreshes it again.
 
-- A phone sender page with rear-camera access and an HTTPS URL reachable from the phone.
-- A WebRTC video connection and signaling between phone and laptop, with connection and retry states.
+Signaling runs in Vite at `/camera-signal`, separate from robot telemetry at `/ws`.
+No extra server process or dependency is needed. Both `npm run dev` and `npm run preview -- --host 0.0.0.0`
+provide signaling. This is a same-network connection: it does not configure a TURN
+relay for networks that block direct device-to-device traffic. Static hosting alone
+does not provide the signaling endpoint. Keep the phone page visible while streaming.
+
+**Evaluation still uses the simulator's observations and telemetry.** Phone video is
+available for preview/debugging; the remaining measurement integration is:
+
 - Feed received video frames into the simulator's refined `DICT_5X5_100` worker
   (station 0, robot 1, medicine box 2). The older live page at `/` uses a different detector.
 - Replace simulated focal length, gravity and marker dimensions with phone calibration,
