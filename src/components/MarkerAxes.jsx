@@ -1,7 +1,7 @@
 import { markerFrame } from '../utils/markerFrame';
 
-export default function MarkerAxes({ corners }) {
-  const frame = markerFrame(corners);
+export default function MarkerAxes({ corners, length }) {
+  const frame = markerFrame(corners, length);
   if (!frame) return null;
   const { origin, x, y } = frame;
   return <g aria-label="Marker coordinate frame">

@@ -36,6 +36,72 @@ The Vite configuration enables a self-signed HTTPS certificate. HTTPS is needed 
 
 The app uses the phone camera, not a camera stream from the robot. Keep the phone pointed at the robot and markers while using the app.
 
+## 3D robot simulator
+
+Open `https://localhost:5173/?scene=sim3d`. A three.js arena stands in for the real
+room: a two-wheeled robot (box body, two wheels), a medicine box on a front tray and a
+charging station with a floor pad. Each carries its own ArUco marker (OpenCV
+DICT_5X5_100):
+
+| Object | Marker ID | Black-square size |
+| --- | ---: | ---: |
+| Charging station (on its raised back tower) | 0 | 15 cm |
+| Robot body (top) | 1 | 14 cm |
+| Medicine box (top) | 2 | 10 cm |
+
+A fixed virtual **phone camera** renders the arena at 1920×1080. Three mounts are
+available: tripod at the south edge, shelf in a corner, and overhead. The detector
+only gets the rendered pixels. It runs in a Web Worker at up to 10 Hz, and the outlines,
+labels and +X/+Y axes are SVG drawn over the image. The robot's +X axis is its
+forward direction. Positions are image pixels; no metric calibration yet.
+
+### Controls
+
+| Key | Button | Command |
+| --- | --- | --- |
+| `W` / `↑` | ▲ Fwd | Forward |
+| `S` / `↓` | ▼ Back | Backward |
+| `A` / `←` | ⟲ 90° | Turn left 90° in place |
+| `D` / `→` | 90° ⟳ | Turn right 90° in place |
+| `Space` / `X` | ■ Stop | Stop |
+
+**Hold to drive** moves while the key is held. **Glove-style** latches forward/backward
+until Stop (or until the robot is blocked). This copies the glove's five discrete
+commands, and a real glove adapter can later call the same `command()` entry point
+(`src/sim/simController.js`). Turns accelerate and decelerate onto exactly 90°. Driving
+waits until the turn has finished.
+
+### Simulated physics and telemetry
+
+- Kinematic differential drive: 0.35 m/s top speed with acceleration and braking limits.
+  The wheels spin to match the motion.
+- The body leans into acceleration (a damped spring towards atan(a/g)) and the
+  telemetry reports this as tilt. This is a visual/telemetry stand-in, not a balance controller.
+- The robot collides with the station and the arena walls.
+- **Docking:** the body front must be within 3 cm of the station's contact face, within
+  5 cm laterally and 10° of square, with the robot stopped. After 0.8 s of stable contact
+  the simulated CHG/STAT line asserts. Charging telemetry and the station LED turn on,
+  and both turn off as soon as the robot leaves.
+- The floor shows the §4.3 approach region as a 90° sector in front of the station. Its
+  30 cm radius is measured from the contact face, which is this simulator's
+  interpretation of "30 cm-radius area centred on the station".
+- A telemetry packet in the same `{ tilt, battery, charging }` shape as `mock-esp32.js` is
+  produced at 1 Hz.
+
+Everything runs on a simulation clock. If a device renders too slowly, the simulation
+runs in slow motion rather than skipping time, and the **Sim speed** readout drops below
+1×. A software-rendered headless browser runs at roughly 0.3×; a GPU machine should run
+at about 1×.
+
+The ground-truth panel and top-down mini-map show simulator state that the app would
+not see in reality. They are for checking the camera-based measurements against.
+
+Known visibility limits (real occlusion and resolution effects, kept on purpose): the
+medicine box can be missed when the robot is in a far corner at an angle, or when the
+body hides it from the corner camera.
+
+Physics tests: `node --test tests/simWorld.test.js`.
+
 ## Placeholder image experiment
 
 ### Draggable 2D playground
@@ -272,8 +338,16 @@ The report includes task, duration, measured distance, tilt, result, diagnostic 
 
 ```text
 src/
+  sim/
+    simConfig.js             Dimensions, marker IDs, speeds, docking tolerances
+    world.js                 Pure physics: drive, 90° turns, lean, collisions, docking, battery
+    simController.js         Operator commands (keyboard / buttons / future glove)
+    scene3d.js               three.js arena, robot, station and camera presets
+    markerTexture.js         Draws ArUco marker textures from the dictionary
+    detector.worker.js       Off-thread ArUco detection
   App.jsx                    Main page layout and shared hook state
   components/
+    Simulator3D.jsx          3D simulator page (?scene=sim3d)
     CameraView.jsx           Phone camera feed and processing canvas
     TelemetryHud.jsx         Robot and vision stats
     TestManager.jsx          Evaluation selection, controls, and report
