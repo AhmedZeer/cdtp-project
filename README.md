@@ -87,6 +87,28 @@ to misread small or oblique markers, and refining first fixes that. Each cell is
 read from its central 4×4 of the 8×8 warped pixels, away from blurred cell edges. It is
 the detector option `refine: true`; the live camera page does not use it yet.
 
+### Phone camera debugging placeholder
+
+Below the simulator's drive controls, **Phone camera preview** copies the rendered
+camera into a 640×360 mock preview, capped at 10 frames per second. It shows the
+source resolution, measured preview rate and copied-frame count. **Pause preview**
+holds the last frame; **Resume preview** continues without pausing the simulator.
+The panel is labelled **Mock · debug only**, and the phone link remains **Not
+connected**.
+
+The intended integration is phone video streamed to the laptop. To replace this
+placeholder, the remaining work is:
+
+- A phone sender page with rear-camera access and an HTTPS URL reachable from the phone.
+- A WebRTC video connection and signaling between phone and laptop, with connection and retry states.
+- Feed received video frames into the simulator's refined `DICT_5X5_100` worker
+  (station 0, robot 1, medicine box 2). The older live page at `/` uses a different detector.
+- Replace simulated focal length, gravity and marker dimensions with phone calibration,
+  phone sensor readings and measurements of the real marker mounts. Reset calibration
+  when the camera, video orientation or resolution changes.
+- Connect real telemetry and available glove-command evidence to the shared recorder
+  using a common clock, then validate metric accuracy and dropout handling on hardware.
+
 ### Controls
 
 | Key | Button | Command |

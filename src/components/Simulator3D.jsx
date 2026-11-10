@@ -10,6 +10,7 @@ import { metricScene } from '../utils/metricScene';
 import { centre } from '../utils/playgroundGeometry';
 import { markerFrame } from '../utils/markerFrame';
 import MarkerAxes from './MarkerAxes';
+import PhoneCameraDebug from './PhoneCameraDebug';
 import EvaluationPanel, { LiveStatusBar } from './EvaluationPanel';
 import { createRunRecorder } from '../eval/runRecorder';
 import { createMotionEstimator } from '../eval/motionState';
@@ -251,6 +252,7 @@ export default function Simulator3D() {
 
           <LiveStatusBar motion={vision.motion} telemetry={telemetry} linkSilenceS={hud.linkSilenceS} run={running ? hud.run : null} />
           <Controls mode={mode} command={controller.command} driveLabel={driveLabel} />
+          <PhoneCameraDebug sourceRef={canvasRef} sourceError={error} />
         </section>
 
         <aside className="flex w-full flex-col gap-3 text-xs xl:w-96">
