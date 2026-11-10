@@ -149,6 +149,56 @@ robot, and *Error vs truth* compares the two.
 - Known error sources (kept on purpose): the body lean shifts the robot marker by up to
   about 1 cm while it accelerates, and each calibration draws a fresh IMU error.
 
+### Evaluation (§5.2)
+
+The **Evaluation** panel runs the four §5.2 tasks against the camera's metric
+measurements and the robot's 1 Hz telemetry. The code is in `src/eval/` and is
+independent of the simulator, so the live phone page can feed it the same records.
+
+1. Choose a task (for Robot Guidance, also the commanded direction). **Start Test**
+   needs a valid calibration and locks the camera preset, calibration and robot reset
+   until the test ends.
+2. Under the camera, a status bar shows live: the motion state measured by the camera
+   (moving / turning / static balance / recovering balance / fallen, with direction),
+   tilt, charging, robot link (LOST after more than 2 s without a packet) and the test
+   timer.
+3. The test ends itself when the task's completion condition is met, or press
+   **End Test**. Tasks the document does not time-limit stop after 180 s.
+
+| Task | Ends automatically | Checks |
+| --- | --- | --- |
+| Static Balance (A) | at 30 s | 30 ± 2 s; stayed within 5 cm of the start |
+| Robot Guidance (B) | after ≥ 0.5 m of travel and a 3 s stop | 0.8–1.2 m start to end; within 20° of the commanded axis; a matching command was issued |
+| Charging (C) | 1 s after charging is reported at the dock | started inside the approach region; docked (camera: front gap ≤ 4 cm, lateral ≤ 5 cm, angle ≤ 10°, held 0.5 s); no operator input from start to docking; charging reported ≤ 5 s after docking |
+| Integrated (E) | as Charging | waited 5 s in place; drove 0.8–1.2 m (path) with a ≥ 60° turn; held still 5 s (the delivery point); then reached the approach region, docked autonomously and started charging within 5 s |
+
+Every task also checks: camera tracking (no gap over 1 s), the telemetry link (no
+silence over 2 s), balance (no tilt of 45° or more) and that the medicine box stayed on
+the robot (seen off it for 0.5 s = dropped). Each check is marked as either a
+specification value or an app threshold. A run **passes** (5 points) only if every
+check passes. It **fails** on any violated check, and is **inconclusive** when required
+evidence is missing. The run history lists every run and adds up C5 over the latest
+four integrated runs.
+
+**Autonomy evidence:** a run fails "Autonomous docking" if, between entering the
+approach region (or Start Test, for Charging) and docking, a command was issued or
+operator input was still driving the robot. A latched glove-style forward started
+earlier still counts. The simulator has no autonomous docking yet, so a robot driven
+into the dock by hand fails this check, as it would in the real test.
+
+**Tamper evidence:** each finished run is sealed. That is a SHA-256 digest over the full
+record (every camera frame, telemetry packet and command, with timestamps) and its
+result. **Download sealed record** saves it as JSON. **Verify a saved record** recomputes
+the digest and re-runs the evaluator on the stored data, so changing either the data or
+the verdict shows as *ALTERED*. A video recording is not included; the timestamped
+record is the §5.2 alternative.
+
+*Simulate telemetry dropout* (Setup) stops the robot's packets so the link check can be
+exercised.
+
+Evaluation tests: `node --test tests/evaluateRun.test.js tests/motionState.test.js`.
+These drive the simulator physics through scripted runs of each task.
+
 Physics tests: `node --test tests/simWorld.test.js`. Calibration accuracy for every
 camera preset: `node --test tests/cameraCalibration.test.js`.
 

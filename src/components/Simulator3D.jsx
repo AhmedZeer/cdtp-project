@@ -9,6 +9,10 @@ import { metricScene } from '../utils/metricScene';
 import { centre } from '../utils/playgroundGeometry';
 import { markerFrame } from '../utils/markerFrame';
 import MarkerAxes from './MarkerAxes';
+import EvaluationPanel, { LiveStatusBar } from './EvaluationPanel';
+import { createRunRecorder } from '../eval/runRecorder';
+import { createMotionEstimator } from '../eval/motionState';
+import { sealRun } from '../eval/seal';
 
 const ROLE_BY_ID = Object.fromEntries(Object.entries(MARKERS).map(([role, m]) => [m.id, role]));
 const ROLE_COLOURS = { robot: '#10b981', medicine: '#f43f5e', station: '#38bdf8' };
@@ -65,7 +69,7 @@ export default function Simulator3D() {
   const setMode = (next) => { controller.setMode(next); setModeState(next); };
   const [preset, setPreset] = useState('tripod');
   const [truth, setTruth] = useState(() => snapshot(controller));
-  const [vision, setVision] = useState({ markers: [], ms: 0, at: 0 });
+  const [vision, setVision] = useState({ markers: [], ms: 0, at: 0, metric: null, motion: { state: 'not-tracked', direction: null } });
   const [telemetry, setTelemetry] = useState(null);
   const [error, setError] = useState('');
   const [calibrator] = useState(() => createStationCalibrator({ id: MARKERS.station.id, size: MARKERS.station.size, height: MARKER_MOUNTS.station.height }));
@@ -81,6 +85,27 @@ export default function Simulator3D() {
   const recalibrate = () => { staleBeforeRef.current = postedSeqRef.current; setCalibration(calibrator.reset()); };
   // Detections already in flight when the view or settings change must not feed the new calibration.
   const postedSeqRef = useRef(0), staleBeforeRef = useRef(0);
+
+  // Evaluation (§5.2): the recorder lives in a ref so every detection, packet and command reaches
+  // it directly from the loop/worker callbacks, not through batched React state.
+  const runRef = useRef(null), endRunRef = useRef(() => {}), latestPacketRef = useRef(null);
+  const [runTask, setRunTask] = useState(null);
+  const [hud, setHud] = useState({ run: null, linkSilenceS: null });
+  const [results, setResults] = useState([]);
+  const [dropout, setDropoutState] = useState(false);
+  const dropoutRef = useRef(false);
+  const setDropout = (on) => { dropoutRef.current = on; setDropoutState(on); };
+  useEffect(() => controller.subscribe((name) => runRef.current?.addCommand(controller.world.time, name)), [controller]);
+  const startRun = (task) => {
+    const cal = calibrator.status.cal;
+    runRef.current = createRunRecorder({
+      task, startT: controller.world.time, commandsAvailable: true,
+      meta: { source: 'simulator', camera: preset, commandMode: mode,
+        calibration: { cameraHeightM: cal.cameraHeight, reprojectionPx: cal.reprojectionPx, focalPx: cal.K.fx, tiltFromImu: calibrator.status.usedGravity } },
+    });
+    setRunTask(task);
+  };
+  const resetRobot = () => { controller.reset(); latestPacketRef.current = null; };
 
   useEffect(() => { sceneRef.current?.setCameraPreset(preset); }, [preset]);
 
@@ -109,17 +134,32 @@ export default function Simulator3D() {
     sceneRef.current = sim;
     sim.setCameraPreset(preset);
     const worker = new Worker(new URL('../sim/detector.worker.js', import.meta.url), { type: 'module' });
-    let inFlight = false, seq = 0;
+    let inFlight = false, seq = 0, operatorAtGrab = false;
+    const motionEstimator = createMotionEstimator();
     worker.onmessage = ({ data }) => {
       inFlight = false;
-      setVision({ markers: data.markers.map(measure), ms: data.ms, at: data.simTime });
-      if (data.seq <= staleBeforeRef.current) return;
-      const settings = calSettingsRef.current;
-      setCalibration(calibrator.push(data.markers, {
-        getIntrinsics: () => presetIntrinsics(settings.preset), // stands in for the phone's factory calibration
-        getUp: () => (settings.useGravity ? noisyUp(sim.camera) : null),
-        estimateFocal: settings.estimateFocal,
-      }));
+      let status = calibrator.status;
+      if (data.seq > staleBeforeRef.current) {
+        const settings = calSettingsRef.current;
+        status = calibrator.push(data.markers, {
+          getIntrinsics: () => presetIntrinsics(settings.preset), // stands in for the phone's factory calibration
+          getUp: () => (settings.useGravity ? noisyUp(sim.camera) : null),
+          estimateFocal: settings.estimateFocal,
+        });
+        setCalibration(status);
+      }
+      const metric = status.state === 'ready' ? metricScene(status.cal, data.markers, GEOMETRY) : null;
+      const motion = motionEstimator.observe(data.simTime, metric?.robot ?? null, latestPacketRef.current?.tilt ?? null);
+      runRef.current?.addFrame(data.simTime, metric?.robot ?? null, metric?.medicine ?? null, operatorAtGrab);
+      setVision({ markers: data.markers.map(measure), ms: data.ms, at: data.simTime, metric, motion });
+    };
+    endRunRef.current = (reason) => {
+      const run = runRef.current;
+      if (!run) return;
+      runRef.current = null;
+      const record = run.finish(controller.world.time, reason);
+      setRunTask(null);
+      sealRun(record).then((sealed) => setResults((prev) => [sealed, ...prev]));
     };
     worker.onerror = (e) => { inFlight = false; setError(`Detector failed: ${e.message}`); };
     const grab = document.createElement('canvas');
@@ -146,16 +186,29 @@ export default function Simulator3D() {
         grabCtx.drawImage(sim.renderer.domElement, 0, 0);
         const image = grabCtx.getImageData(0, 0, RENDER_WIDTH, RENDER_HEIGHT);
         postedSeqRef.current = ++seq;
+        operatorAtGrab = controller.operatorActive(); // only one frame is ever in flight
         worker.postMessage({ image, family: MARKER_FAMILY, minPerimeterFraction: 0.03, simTime: world.time, seq }, [image.data.buffer]);
       }
       if (world.time >= nextTelemetry || nextTelemetry - world.time > 1 / TELEMETRY_HZ) { // 1 Hz on the simulation clock (re-arms after reset)
         nextTelemetry = world.time + 1 / TELEMETRY_HZ;
-        setTelemetry({ ...telemetryPacket(world, (Math.random() - 0.5) * 0.2), simTime: world.time });
+        if (!dropoutRef.current) { // "Simulate telemetry dropout" withholds packets, like a lost Wi-Fi link
+          const packet = telemetryPacket(world, (Math.random() - 0.5) * 0.2);
+          latestPacketRef.current = { ...packet, simTime: world.time };
+          setTelemetry(latestPacketRef.current);
+          runRef.current?.addPacket(world.time, packet);
+        }
       }
+      const reason = runRef.current?.autoEnd(world.time);
+      if (reason) endRunRef.current(reason);
       if (now - rate.wall >= 1000) {
         rate = { wall: now, sim: world.time, value: Math.max(0, (world.time - rate.sim) / ((now - rate.wall) / 1000)) };
       }
-      if (now - lastHud >= 100) { lastHud = now; setTruth({ ...snapshot(controller), simSpeed: rate.value }); }
+      if (now - lastHud >= 100) {
+        lastHud = now;
+        setTruth({ ...snapshot(controller), simSpeed: rate.value });
+        const lastPacket = latestPacketRef.current;
+        setHud({ run: runRef.current?.progress(world.time) ?? null, linkSilenceS: lastPacket ? Math.max(0, world.time - lastPacket.simTime) : null });
+      }
       frame = requestAnimationFrame(loop);
     }
     frame = requestAnimationFrame(loop);
@@ -164,7 +217,9 @@ export default function Simulator3D() {
   }, []);
 
   const byRole = Object.fromEntries(vision.markers.filter((m) => m.role).map((m) => [m.role, m]));
-  const metric = useMemo(() => (calibration.cal && calibration.state === 'ready' ? metricScene(calibration.cal, vision.markers, GEOMETRY) : null), [calibration, vision.markers]);
+  const metric = vision.metric;
+  const running = runTask !== null;
+  const notReadyReason = calibration.state === 'ready' ? '' : calibration.state === 'moved' ? 'Recalibrate first: the station marker moved.' : 'Waiting for the camera calibration.';
   const truthStation = useMemo(() => {
     const local = toStationFrame(truth.station, truth.x, truth.y);
     return { u: local.u, w: local.w, heading: wrapAngle((truth.heading * Math.PI) / 180 - truth.station.heading) };
@@ -191,13 +246,17 @@ export default function Simulator3D() {
             {error && <p className="absolute inset-0 grid place-items-center p-4 text-center text-sm text-red-300">{error}</p>}
           </div>
 
+          <LiveStatusBar motion={vision.motion} telemetry={telemetry} linkSilenceS={hud.linkSilenceS} run={running ? hud.run : null} />
           <Controls mode={mode} command={controller.command} driveLabel={driveLabel} />
         </section>
 
         <aside className="flex w-full flex-col gap-3 text-xs xl:w-96">
+          <EvaluationPanel ready={calibration.state === 'ready'} notReadyReason={notReadyReason} run={running ? hud.run ?? { elapsedS: 0, displacementM: null, stillForS: null } : null}
+            runTask={runTask} onStart={startRun} onEnd={() => endRunRef.current('user')} results={results} />
+
           <Panel title="Setup">
             <label className="mb-2 block">Phone camera
-              <select className="mt-1 w-full rounded border border-slate-700 bg-slate-950 p-2" value={preset}
+              <select disabled={running} className="mt-1 w-full rounded border border-slate-700 bg-slate-950 p-2 disabled:opacity-50" value={preset}
                 onChange={(e) => { setPreset(e.target.value); setCalSettings({ preset: e.target.value }); e.target.blur(); }}>
                 {Object.entries(CAMERA_PRESETS).map(([key, p]) => <option key={key} value={key}>{p.label}</option>)}
               </select>
@@ -207,7 +266,9 @@ export default function Simulator3D() {
               <label className="mr-4"><input type="radio" checked={mode === 'hold'} onChange={() => setMode('hold')} /> Hold to drive</label>
               <label><input type="radio" checked={mode === 'latched'} onChange={() => setMode('latched')} /> Glove-style (latched until Stop)</label>
             </fieldset>
-            <button className="rounded bg-slate-700 px-3 py-2 font-semibold hover:bg-slate-600" onClick={(e) => { controller.reset(); e.currentTarget.blur(); }}>Reset robot</button>
+            <label className="mb-2 block"><input type="checkbox" checked={dropout} onChange={(e) => setDropout(e.target.checked)} /> Simulate telemetry dropout (robot stops sending packets)</label>
+            <button disabled={running} className="rounded bg-slate-700 px-3 py-2 font-semibold hover:bg-slate-600 disabled:opacity-50" onClick={(e) => { resetRobot(); e.currentTarget.blur(); }}>Reset robot</button>
+            {running && <span className="ml-2 text-slate-500">Camera and reset are locked during a test.</span>}
           </Panel>
 
           <Panel title={`Camera detections (${fmt(vision.ms, 0)} ms)`}>
@@ -228,7 +289,7 @@ export default function Simulator3D() {
             <p className="mt-2 text-slate-500">DICT_5X5_100 · image pixels; metric values are in the calibration panel.</p>
           </Panel>
 
-          <CalibrationPanel calibration={calibration} settings={calSettings} onSettings={setCalSettings} onRecalibrate={recalibrate}
+          <CalibrationPanel locked={running} calibration={calibration} settings={calSettings} onSettings={setCalSettings} onRecalibrate={recalibrate}
             metric={metric} truthStation={truthStation} />
 
           <Panel title="Robot telemetry (1 Hz, ESP32 packet format)">
@@ -346,7 +407,7 @@ const STATE_TEXT = {
 };
 
 /** Metric calibration status/settings plus the camera's metric measurements in the station frame. */
-function CalibrationPanel({ calibration, settings, onSettings, onRecalibrate, metric, truthStation }) {
+function CalibrationPanel({ locked, calibration, settings, onSettings, onRecalibrate, metric, truthStation }) {
   const { state, cal } = calibration;
   const [text, tone] = STATE_TEXT[state];
   const robot = metric?.robot, medicine = metric?.medicine;
@@ -359,9 +420,9 @@ function CalibrationPanel({ calibration, settings, onSettings, onRecalibrate, me
         {state === 'failed' && <span className="block font-normal text-red-300">{calibration.reason}</span>}
       </p>
       <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1">
-        <label><input type="checkbox" checked={settings.useGravity} onChange={(e) => onSettings({ useGravity: e.target.checked })} /> Phone tilt from accelerometer</label>
-        <label><input type="checkbox" checked={settings.estimateFocal} onChange={(e) => onSettings({ estimateFocal: e.target.checked })} /> Estimate focal length</label>
-        <button className="rounded bg-slate-700 px-2 py-1 font-semibold hover:bg-slate-600" onClick={(e) => { onRecalibrate(); e.currentTarget.blur(); }}>Recalibrate</button>
+        <label><input type="checkbox" disabled={locked} checked={settings.useGravity} onChange={(e) => onSettings({ useGravity: e.target.checked })} /> Phone tilt from accelerometer</label>
+        <label><input type="checkbox" disabled={locked} checked={settings.estimateFocal} onChange={(e) => onSettings({ estimateFocal: e.target.checked })} /> Estimate focal length</label>
+        <button disabled={locked} className="rounded bg-slate-700 px-2 py-1 font-semibold hover:bg-slate-600 disabled:opacity-50" onClick={(e) => { onRecalibrate(); e.currentTarget.blur(); }}>Recalibrate</button>
       </div>
       {!settings.useGravity && <p className="mb-2 text-amber-300">Without the accelerometer the camera tilt comes from one small marker and can be off by tens of centimetres.</p>}
       {cal && <dl className="mb-2 grid grid-cols-3 gap-2">

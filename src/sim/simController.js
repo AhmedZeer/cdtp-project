@@ -6,7 +6,12 @@ const idle = () => ({ held: { forward: false, backward: false }, latched: 0 });
 
 export function createSimController() {
   let input = idle();
+  const listeners = new Set();
   const controller = {
+    /** Called with (name) on every command press: the operator-command log for evaluation. */
+    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+    /** Operator input is moving the robot right now: a held/latched drive or a turn it requested. */
+    operatorActive() { return controller.drive() !== 0 || controller.world.robot.turnTarget !== null; },
     world: createWorld(),
     mode: 'hold', // hold = drive while pressed; latched = glove-style, drive until Stop
     setMode(mode) { controller.mode = mode; input = idle(); },
@@ -14,6 +19,7 @@ export function createSimController() {
     releaseAll() { input.held = { forward: false, backward: false }; },
     /** name: forward | backward | left | right | stop; pressed: key/pointer down (true) or up (false). */
     command(name, pressed) {
+      if (pressed) listeners.forEach((fn) => fn(name));
       if (name === 'left' || name === 'right') { if (pressed) requestTurn(controller.world, name); return; }
       if (name === 'stop') { if (pressed) input = idle(); return; }
       if (controller.mode === 'latched') { if (pressed) input.latched = name === 'forward' ? 1 : -1; }
