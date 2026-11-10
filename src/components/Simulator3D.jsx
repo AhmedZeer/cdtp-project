@@ -1,8 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createSimScene, CAMERA_PRESETS, RENDER_WIDTH, RENDER_HEIGHT } from '../sim/scene3d';
-import { advance, telemetryPacket, dockGeometry } from '../sim/world';
+import { advance, telemetryPacket, dockGeometry, toStationFrame, inApproachRegion, APPROACH_RADIUS, wrapAngle } from '../sim/world';
+import { presetIntrinsics, upInCamera } from '../sim/cameraRig';
 import { createSimController } from '../sim/simController';
-import { ARENA, ROBOT, STATION, MARKERS, MARKER_FAMILY, PHYSICS_HZ, TELEMETRY_HZ, DETECTION_HZ } from '../sim/simConfig';
+import { ARENA, ROBOT, STATION, MARKERS, MARKER_MOUNTS, MARKER_FAMILY, PHYSICS_HZ, TELEMETRY_HZ, DETECTION_HZ } from '../sim/simConfig';
+import { createStationCalibrator } from '../utils/stationCalibrator';
+import { metricScene } from '../utils/metricScene';
 import { centre } from '../utils/playgroundGeometry';
 import { markerFrame } from '../utils/markerFrame';
 import MarkerAxes from './MarkerAxes';
@@ -11,6 +14,21 @@ const ROLE_BY_ID = Object.fromEntries(Object.entries(MARKERS).map(([role, m]) =>
 const ROLE_COLOURS = { robot: '#10b981', medicine: '#f43f5e', station: '#38bdf8' };
 const ROLE_LABELS = { robot: 'Robot', medicine: 'Medicine box', station: 'Station' };
 const deg = (rad) => (rad * 180) / Math.PI;
+const GEOMETRY = {
+  ids: { robot: MARKERS.robot.id, medicine: MARKERS.medicine.id }, mounts: MARKER_MOUNTS,
+  stationDepth: STATION.depth, robotDepth: ROBOT.body.depth, inApproachRegion, boxTolerance: 0.05,
+};
+const IMU_NOISE_DEG = 0.3; // simulated phone accelerometer error when reading the camera tilt
+
+/** Phone "up" vector with a small random tilt error, like a real accelerometer reading. */
+function noisyUp(camera) {
+  const up = upInCamera(camera);
+  const r = [Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5];
+  const d = r[0] * up[0] + r[1] * up[1] + r[2] * up[2];
+  const perp = r.map((v, i) => v - d * up[i]), n = Math.hypot(...perp) || 1, a = (IMU_NOISE_DEG * Math.PI) / 180;
+  return up.map((v, i) => v * Math.cos(a) + (perp[i] / n) * Math.sin(a));
+}
+
 const fmt = (v, digits = 2) => (v === null || v === undefined || Number.isNaN(v) ? '—' : v.toFixed(digits));
 
 const KEYMAP = {
@@ -38,6 +56,8 @@ function measure(marker) {
 
 export default function Simulator3D() {
   const canvasRef = useRef(null);
+  const viewRef = useRef(null);
+  const unit = useImagePixelsPerScreenPixel(viewRef);
   const [controller] = useState(createSimController);
   useEffect(() => { if (import.meta.env.DEV) window.__sim = controller; }, [controller]); // dev-only hook for scripted checks
   const sceneRef = useRef(null);
@@ -48,6 +68,19 @@ export default function Simulator3D() {
   const [vision, setVision] = useState({ markers: [], ms: 0, at: 0 });
   const [telemetry, setTelemetry] = useState(null);
   const [error, setError] = useState('');
+  const [calibrator] = useState(() => createStationCalibrator({ id: MARKERS.station.id, size: MARKERS.station.size, height: MARKER_MOUNTS.station.height }));
+  const [calibration, setCalibration] = useState(calibrator.status);
+  const [calSettings, setCalSettingsState] = useState({ useGravity: true, estimateFocal: false });
+  const calSettingsRef = useRef({ ...calSettings, preset });
+  const setCalSettings = (patch) => {
+    calSettingsRef.current = { ...calSettingsRef.current, ...patch };
+    setCalSettingsState((prev) => ({ ...prev, ...patch }));
+    staleBeforeRef.current = postedSeqRef.current;
+    setCalibration(calibrator.reset());
+  };
+  const recalibrate = () => { staleBeforeRef.current = postedSeqRef.current; setCalibration(calibrator.reset()); };
+  // Detections already in flight when the view or settings change must not feed the new calibration.
+  const postedSeqRef = useRef(0), staleBeforeRef = useRef(0);
 
   useEffect(() => { sceneRef.current?.setCameraPreset(preset); }, [preset]);
 
@@ -80,6 +113,13 @@ export default function Simulator3D() {
     worker.onmessage = ({ data }) => {
       inFlight = false;
       setVision({ markers: data.markers.map(measure), ms: data.ms, at: data.simTime });
+      if (data.seq <= staleBeforeRef.current) return;
+      const settings = calSettingsRef.current;
+      setCalibration(calibrator.push(data.markers, {
+        getIntrinsics: () => presetIntrinsics(settings.preset), // stands in for the phone's factory calibration
+        getUp: () => (settings.useGravity ? noisyUp(sim.camera) : null),
+        estimateFocal: settings.estimateFocal,
+      }));
     };
     worker.onerror = (e) => { inFlight = false; setError(`Detector failed: ${e.message}`); };
     const grab = document.createElement('canvas');
@@ -105,7 +145,8 @@ export default function Simulator3D() {
         inFlight = true;
         grabCtx.drawImage(sim.renderer.domElement, 0, 0);
         const image = grabCtx.getImageData(0, 0, RENDER_WIDTH, RENDER_HEIGHT);
-        worker.postMessage({ image, family: MARKER_FAMILY, minPerimeterFraction: 0.03, simTime: world.time, seq: ++seq }, [image.data.buffer]);
+        postedSeqRef.current = ++seq;
+        worker.postMessage({ image, family: MARKER_FAMILY, minPerimeterFraction: 0.03, simTime: world.time, seq }, [image.data.buffer]);
       }
       if (world.time >= nextTelemetry || nextTelemetry - world.time > 1 / TELEMETRY_HZ) { // 1 Hz on the simulation clock (re-arms after reset)
         nextTelemetry = world.time + 1 / TELEMETRY_HZ;
@@ -123,6 +164,11 @@ export default function Simulator3D() {
   }, []);
 
   const byRole = Object.fromEntries(vision.markers.filter((m) => m.role).map((m) => [m.role, m]));
+  const metric = useMemo(() => (calibration.cal && calibration.state === 'ready' ? metricScene(calibration.cal, vision.markers, GEOMETRY) : null), [calibration, vision.markers]);
+  const truthStation = useMemo(() => {
+    const local = toStationFrame(truth.station, truth.x, truth.y);
+    return { u: local.u, w: local.w, heading: wrapAngle((truth.heading * Math.PI) / 180 - truth.station.heading) };
+  }, [truth]);
   const driveLabel = truth.drive > 0 ? 'forward' : truth.drive < 0 ? 'backward' : 'stopped';
 
   return (
@@ -139,23 +185,9 @@ export default function Simulator3D() {
 
       <div className="flex flex-col gap-4 xl:flex-row">
         <section className="min-w-0 flex-1">
-          <div className="relative w-full overflow-hidden rounded-lg border border-slate-800 bg-black" style={{ aspectRatio: `${RENDER_WIDTH} / ${RENDER_HEIGHT}` }}>
+          <div ref={viewRef} className="relative w-full overflow-hidden rounded-lg border border-slate-800 bg-black" style={{ aspectRatio: `${RENDER_WIDTH} / ${RENDER_HEIGHT}` }}>
             <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" aria-label="Simulated phone camera view" />
-            <svg className="pointer-events-none absolute inset-0 h-full w-full" viewBox={`0 0 ${RENDER_WIDTH} ${RENDER_HEIGHT}`} aria-hidden="true">
-              <defs>
-                <marker id="marker-x-arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#dc2626" /></marker>
-                <marker id="marker-y-arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#16a34a" /></marker>
-              </defs>
-              {vision.markers.map((m, i) => (
-                <g key={`${m.id}-${i}`}>
-                  <polygon points={m.corners.map((p) => `${p.x},${p.y}`).join(' ')} fill="none" stroke={ROLE_COLOURS[m.role] ?? '#facc15'} strokeWidth="3" />
-                  <MarkerAxes corners={m.corners} length={40} />
-                  <text x={m.centre.x + 12} y={m.centre.y - 14} fontSize="18" fontWeight="bold" fill={ROLE_COLOURS[m.role] ?? '#facc15'} stroke="#020617" strokeWidth="4" paintOrder="stroke">
-                    {ROLE_LABELS[m.role] ?? 'Unknown'} #{m.id}
-                  </text>
-                </g>
-              ))}
-            </svg>
+            <DetectionOverlay markers={vision.markers} unit={unit} />
             {error && <p className="absolute inset-0 grid place-items-center p-4 text-center text-sm text-red-300">{error}</p>}
           </div>
 
@@ -166,7 +198,7 @@ export default function Simulator3D() {
           <Panel title="Setup">
             <label className="mb-2 block">Phone camera
               <select className="mt-1 w-full rounded border border-slate-700 bg-slate-950 p-2" value={preset}
-                onChange={(e) => { setPreset(e.target.value); e.target.blur(); }}>
+                onChange={(e) => { setPreset(e.target.value); setCalSettings({ preset: e.target.value }); e.target.blur(); }}>
                 {Object.entries(CAMERA_PRESETS).map(([key, p]) => <option key={key} value={key}>{p.label}</option>)}
               </select>
             </label>
@@ -193,8 +225,11 @@ export default function Simulator3D() {
                 })}
               </tbody>
             </table>
-            <p className="mt-2 text-slate-500">DICT_5X5_100 · image pixels only, no metric calibration yet.</p>
+            <p className="mt-2 text-slate-500">DICT_5X5_100 · image pixels; metric values are in the calibration panel.</p>
           </Panel>
+
+          <CalibrationPanel calibration={calibration} settings={calSettings} onSettings={setCalSettings} onRecalibrate={recalibrate}
+            metric={metric} truthStation={truthStation} />
 
           <Panel title="Robot telemetry (1 Hz, ESP32 packet format)">
             {telemetry ? <dl className="grid grid-cols-3 gap-2">
@@ -218,11 +253,54 @@ export default function Simulator3D() {
               <Stat label="Sim time" value={`${fmt(truth.simTime, 1)} s`} />
               <Stat label="Sim speed" value={`${fmt(truth.simSpeed, 2)}×`} tone={truth.simSpeed < 0.9 ? 'text-amber-400' : ''} />
             </dl>
-            <MiniMap truth={truth} />
+            <MiniMap truth={truth} measured={metric?.robot ?? null} />
           </Panel>
         </aside>
       </div>
     </main>
+  );
+}
+
+/** Image pixels per on-screen pixel of the camera view, so overlay text keeps a fixed on-screen size. */
+function useImagePixelsPerScreenPixel(ref) {
+  const [unit, setUnit] = useState(2);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    const update = () => { if (el.clientWidth > 0) setUnit(RENDER_WIDTH / el.clientWidth); };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref]);
+  return unit;
+}
+
+// On-screen sizes (CSS px) of the overlay; multiplied by `unit` to get image pixels.
+const OVERLAY = { axis: 11, minAxis: 18, maxAxis: 60 };
+
+/** Outlines (coloured by role) and +X/+Y frames for the detected markers, in image pixels. */
+function DetectionOverlay({ markers, unit }) {
+  const items = markers.map((m, i) => {
+    const c = m.corners;
+    const side = c.reduce((sum, p, k) => sum + Math.hypot(c[(k + 1) % 4].x - p.x, c[(k + 1) % 4].y - p.y), 0) / 4;
+    // Axes scale with the marker so neighbouring markers' frames do not run into each other.
+    return { m, key: `${m.id}-${i}`, axisLength: Math.max(OVERLAY.minAxis * unit, Math.min(OVERLAY.maxAxis * unit, side * 0.8)) };
+  });
+
+  return (
+    <svg className="pointer-events-none absolute inset-0 h-full w-full" viewBox={`0 0 ${RENDER_WIDTH} ${RENDER_HEIGHT}`} aria-hidden="true">
+      <defs>
+        <marker id="marker-x-arrow" markerWidth="4" markerHeight="4" refX="3" refY="2" orient="auto"><path d="M0,0 L4,2 L0,4 z" fill="#dc2626" /></marker>
+        <marker id="marker-y-arrow" markerWidth="4" markerHeight="4" refX="3" refY="2" orient="auto"><path d="M0,0 L4,2 L0,4 z" fill="#16a34a" /></marker>
+      </defs>
+      {items.map(({ m, key, axisLength }) => (
+        <g key={key}>
+          <polygon points={m.corners.map((p) => `${p.x},${p.y}`).join(' ')} fill="none" stroke={ROLE_COLOURS[m.role] ?? '#facc15'} strokeWidth={2 * unit} strokeLinejoin="round" />
+          <MarkerAxes corners={m.corners} length={axisLength} unit={unit} fontSize={OVERLAY.axis} strokeWidth={2.5} />
+        </g>
+      ))}
+    </svg>
   );
 }
 
@@ -259,8 +337,62 @@ function Controls({ mode, command, driveLabel }) {
   );
 }
 
-/** Top-down debug map of the true world state (metres). */
-function MiniMap({ truth }) {
+const STATE_TEXT = {
+  waiting: ['Waiting for the station marker…', 'text-amber-400'],
+  collecting: ['Hold the phone still — calibrating…', 'text-cyan-400'],
+  ready: ['Calibrated', 'text-emerald-400'],
+  moved: ['Station marker moved since calibration — recalibrate', 'text-amber-400'],
+  failed: ['Calibration failed', 'text-red-400'],
+};
+
+/** Metric calibration status/settings plus the camera's metric measurements in the station frame. */
+function CalibrationPanel({ calibration, settings, onSettings, onRecalibrate, metric, truthStation }) {
+  const { state, cal } = calibration;
+  const [text, tone] = STATE_TEXT[state];
+  const robot = metric?.robot, medicine = metric?.medicine;
+  const posErr = robot ? Math.hypot(robot.u - truthStation.u, robot.w - truthStation.w) : null;
+  const headErr = robot ? Math.abs(wrapAngle(robot.heading - truthStation.heading)) : null;
+  return (
+    <Panel title="Metric calibration (station marker)">
+      <p className={`mb-2 font-semibold ${tone}`}>
+        {text}{state === 'collecting' && ` ${Math.round(calibration.progress * 100)}%`}
+        {state === 'failed' && <span className="block font-normal text-red-300">{calibration.reason}</span>}
+      </p>
+      <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1">
+        <label><input type="checkbox" checked={settings.useGravity} onChange={(e) => onSettings({ useGravity: e.target.checked })} /> Phone tilt from accelerometer</label>
+        <label><input type="checkbox" checked={settings.estimateFocal} onChange={(e) => onSettings({ estimateFocal: e.target.checked })} /> Estimate focal length</label>
+        <button className="rounded bg-slate-700 px-2 py-1 font-semibold hover:bg-slate-600" onClick={(e) => { onRecalibrate(); e.currentTarget.blur(); }}>Recalibrate</button>
+      </div>
+      {!settings.useGravity && <p className="mb-2 text-amber-300">Without the accelerometer the camera tilt comes from one small marker and can be off by tens of centimetres.</p>}
+      {cal && <dl className="mb-2 grid grid-cols-3 gap-2">
+        <Stat label="Camera height" value={`${fmt(cal.cameraHeight)} m`} />
+        <Stat label="Camera tilt" value={`${fmt(cal.depressionDeg, 1)}° down`} />
+        <Stat label="Reprojection" value={`${fmt(cal.reprojectionPx, 2)} px`} />
+        <Stat label="Focal length" value={`${fmt(cal.K.fx, 0)} px`} />
+        <Stat label="Focal source" value={calibration.focalSource} />
+        <Stat label="Tilt source" value={calibration.usedGravity ? `IMU (±${IMU_NOISE_DEG}°)` : 'marker'} />
+      </dl>}
+      {cal && <>
+        <h3 className="mb-1 mt-3 font-semibold text-slate-300">Robot, from the camera (station frame)</h3>
+        {robot ? <dl className="grid grid-cols-3 gap-2">
+          <Stat label="u, w" value={`${fmt(robot.u)}, ${fmt(robot.w)} m`} />
+          <Stat label="Heading" value={`${fmt(deg(robot.heading), 1)}°`} />
+          <Stat label="To contact face" value={`${fmt(robot.faceDistance)} m`} />
+          <Stat label="Front gap" value={`${fmt(robot.frontGap * 100, 1)} cm`} />
+          <Stat label="Lateral / angle" value={`${fmt(robot.w * 100, 0)} cm / ${fmt(deg(robot.headingError), 0)}°`} />
+          <Stat label={`Approach region (${fmt(APPROACH_RADIUS)} m)`} value={robot.inApproach ? 'inside' : 'outside'} tone={robot.inApproach ? 'text-emerald-400' : ''} />
+          <Stat label="Medicine box" value={medicine ? (medicine.onRobot === null ? 'seen' : medicine.onRobot ? 'on robot' : 'off robot') : 'not seen'}
+            tone={medicine?.onRobot === false ? 'text-red-400' : ''} />
+          <Stat label="Error vs truth" value={`${fmt(posErr * 100, 1)} cm / ${fmt(deg(headErr), 1)}°`} tone={posErr > 0.05 ? 'text-amber-400' : 'text-slate-400'} />
+        </dl> : <p className="text-amber-400">Robot marker not detected.</p>}
+      </>}
+      <p className="mt-2 text-slate-500">Station frame: origin at the station centre, u out of the contact face, w to its left. The robot marker is measured on the plane {fmt(MARKER_MOUNTS.robot.height)} m above the floor.</p>
+    </Panel>
+  );
+}
+
+/** Top-down debug map of the true world state (metres); a dashed outline shows the camera's measurement. */
+function MiniMap({ truth, measured }) {
   const scale = 70, w = ARENA.width * scale, h = ARENA.depth * scale;
   const px = (x) => (x + ARENA.width / 2) * scale, py = (y) => (ARENA.depth / 2 - y) * scale;
   const s = truth.station, sh = (s.heading * 180) / Math.PI;
@@ -268,7 +400,7 @@ function MiniMap({ truth }) {
   return (
     <svg className="mt-3 w-full rounded bg-slate-200" viewBox={`0 0 ${w} ${h}`} aria-label="Top-down map">
       <g transform={`translate(${px(s.x)} ${py(s.y)}) rotate(${-sh})`}>
-        <path d={`M0 0 L${(0.3 + STATION.depth / 2) * scale * Math.cos(Math.PI / 4)} ${-(0.3 + STATION.depth / 2) * scale * Math.sin(Math.PI / 4)} A${(0.3 + STATION.depth / 2) * scale} ${(0.3 + STATION.depth / 2) * scale} 0 0 1 ${(0.3 + STATION.depth / 2) * scale * Math.cos(Math.PI / 4)} ${(0.3 + STATION.depth / 2) * scale * Math.sin(Math.PI / 4)} Z`} fill="#38bdf8" opacity="0.25" />
+        <path d={`M0 0 L${APPROACH_RADIUS * scale * Math.SQRT1_2} ${-APPROACH_RADIUS * scale * Math.SQRT1_2} A${APPROACH_RADIUS * scale} ${APPROACH_RADIUS * scale} 0 0 1 ${APPROACH_RADIUS * scale * Math.SQRT1_2} ${APPROACH_RADIUS * scale * Math.SQRT1_2} Z`} fill="#38bdf8" opacity="0.25" />
         <rect x={STATION.depth / 2 * scale} y={-STATION.pad.width / 2 * scale} width={STATION.pad.length * scale} height={STATION.pad.width * scale} fill="#475569" />
         <rect x={-STATION.depth / 2 * scale} y={-STATION.width / 2 * scale} width={STATION.depth * scale} height={STATION.width * scale} fill={truth.charging ? '#22c55e' : '#0284c7'} />
       </g>
@@ -277,6 +409,14 @@ function MiniMap({ truth }) {
         <rect x={(ROBOT.body.depth / 2 + ROBOT.medicine.gap) * scale} y={-ROBOT.medicine.width / 2 * scale} width={ROBOT.medicine.depth * scale} height={ROBOT.medicine.width * scale} fill="#f43f5e" />
         <line x1="0" y1="0" x2={0.3 * scale} y2="0" stroke="#020617" strokeWidth="2" />
       </g>
+      {measured && (() => {
+        const c = Math.cos(s.heading), si = Math.sin(s.heading);
+        const mx = s.x + measured.u * c - measured.w * si, my = s.y + measured.u * si + measured.w * c;
+        return <g transform={`translate(${px(mx)} ${py(my)}) rotate(${-deg(s.heading + measured.heading)})`} aria-label="Camera-measured robot pose">
+          <rect x={-ROBOT.body.depth / 2 * scale} y={-(ROBOT.track / 2 + ROBOT.wheelWidth / 2) * scale} width={ROBOT.body.depth * scale} height={(ROBOT.track + ROBOT.wheelWidth) * scale} fill="none" stroke="#7c3aed" strokeWidth="2" strokeDasharray="4 3" />
+          <line x1="0" y1="0" x2={0.3 * scale} y2="0" stroke="#7c3aed" strokeWidth="2" strokeDasharray="4 3" />
+        </g>;
+      })()}
     </svg>
   );
 }

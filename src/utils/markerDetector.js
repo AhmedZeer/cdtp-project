@@ -1,4 +1,5 @@
 import aruco from 'js-aruco';
+import { refineCorners } from './cornerRefine.js';
 import dictionary from './aruco6x6_250.json' with { type: 'json' };
 import dictionary5 from './aruco5x5_100.json' with { type: 'json' };
 const { AR, CV } = aruco;
@@ -12,7 +13,17 @@ const codes5 = dictionary5.map((bytes) => bytes.map((byte, i) => byte.toString(2
 
 // js-aruco discards contours shorter than 20% of the image width (≈64 px marker sides at
 // 1280 px). `minPerimeterFraction` lowers that so distant markers in a room-wide view qualify.
-export function createMarkerDetector(family = '6x6_250', { minPerimeterFraction = 0.2 } = {}) {
+// `refine` re-locates each corner to sub-pixel accuracy from the image edges (see cornerRefine.js);
+// needed wherever corners are turned into metric distances.
+export function createMarkerDetector(family = '6x6_250', { minPerimeterFraction = 0.2, refine = false } = {}) {
+  if (refine) {
+    const base = createMarkerDetector(family, { minPerimeterFraction });
+    return { detect(image) {
+      const markers = base.detect(image);
+      const grey = base.grey ?? base.detectors?.[0]?.detector.grey;
+      return grey ? markers.map((m) => ({ ...m, corners: refineCorners(grey, m.corners) })) : markers;
+    } };
+  }
   if (family === 'catalog') {
     const detectors = ['6x6_250', '5x5_100', 'legacy'].map((name) => ({ name, detector: createMarkerDetector(name, { minPerimeterFraction }) }));
     return { detect(image) {

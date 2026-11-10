@@ -11,3 +11,12 @@ export function markerFrame(corners, length = 70) {
   const x = endpoint(corners[1]), y = endpoint(corners[3]);
   return x && y ? { origin, x, y } : null;
 }
+
+/** Where to centre the "+X"/"+Y" text: just past each arrow tip, continuing along the axis. */
+export function axisLabelPositions(frame, offset) {
+  const along = (tip) => {
+    const dx = tip.x - frame.origin.x, dy = tip.y - frame.origin.y, n = Math.hypot(dx, dy) || 1;
+    return { x: tip.x + (dx / n) * offset, y: tip.y + (dy / n) * offset };
+  };
+  return { x: along(frame.x), y: along(frame.y) };
+}

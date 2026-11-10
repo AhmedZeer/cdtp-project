@@ -51,9 +51,20 @@ DICT_5X5_100):
 
 A fixed virtual **phone camera** renders the arena at 1920×1080. Three mounts are
 available: tripod at the south edge, shelf in a corner, and overhead. The detector
-only gets the rendered pixels. It runs in a Web Worker at up to 10 Hz, and the outlines,
-labels and +X/+Y axes are SVG drawn over the image. The robot's +X axis is its
-forward direction. Positions are image pixels; no metric calibration yet.
+only gets the rendered pixels. It runs in a Web Worker at up to 10 Hz. Each detected
+marker gets an SVG outline in its role's colour (station blue, robot green, medicine box
+red) and +X/+Y axes, drawn over the image at a fixed on-screen size. The robot's +X axis
+is its forward direction. The detections table lists image pixels; the calibration panel
+converts them to metres (below).
+
+The simulator's detector refines each corner to sub-pixel accuracy
+(`src/utils/cornerRefine.js`). js-aruco's own corners are whole pixels and sit inside
+the true outline: about 1 px on the station marker and 4 px on the closer robot marker.
+That error is systematic, so it scales every distance. The refinement finds the steepest
+dark-to-light step across each edge (after undoing sRGB gamma), fits a line to each edge
+and intersects neighbouring lines. On the rendered frames this reduces corner error to
+about 0.4 px with no inward bias. It is the detector option `refine: true`; the live
+camera page does not use it yet.
 
 ### Controls
 
@@ -100,7 +111,46 @@ Known visibility limits (real occlusion and resolution effects, kept on purpose)
 medicine box can be missed when the robot is in a far corner at an angle, or when the
 body hides it from the corner camera.
 
-Physics tests: `node --test tests/simWorld.test.js`.
+### Metric calibration
+
+The camera is calibrated from the **station marker** alone. The station stays fixed
+during evaluation (§4.3), and its marker's size (15 cm) and height above the floor are
+known. When the station marker is visible, the app averages 10 detections (about 1 s),
+solves the camera pose and then freezes it. From then on, the robot and medicine-box
+markers are converted to metres by intersecting each corner's viewing ray with the
+horizontal plane at that marker's own known height (`MARKER_MOUNTS` in
+`src/sim/simConfig.js`).
+
+Results are reported in the **station frame**: the origin is the station centre, *u*
+points out of the contact face and *w* points to its left. The panel shows the robot's
+position and heading, its distance to the contact face, the docking front gap, the
+lateral and angle error, whether it is inside the approach region, and whether the
+medicine box is still in the robot's tray (within 5 cm of where the tray holds it).
+The mini-map draws the camera's measurement as a dashed purple outline over the true
+robot, and *Error vs truth* compares the two.
+
+- **Phone tilt from the accelerometer (on by default):** the phone's gravity reading
+  fixes the camera's tilt, and the marker only has to provide yaw and position. This
+  matters. Without it, recovering tilt from one marker about 65 px wide turns about 1 px
+  of corner noise into errors of tens of centimetres. With it, simulated tests show a
+  mean error of about 1–3 cm and a 1 m move measured within about ±3 cm. The simulator
+  adds ±0.3° of IMU error.
+- Measured live on rendered frames with sub-pixel corners and known focal length, at 8
+  robot poses per view: tripod 0.3–1.4 cm, corner shelf 0.4–1.6 cm, overhead 0.2–0.4 cm.
+  Heading error was at most 0.4° in every view. From the tripod, the robot is not
+  detected at all in the two far corners.
+- **Focal length:** this defaults to the camera's known intrinsics (the simulator's
+  equivalent of a phone's factory calibration). *Estimate focal length* derives it from
+  the station marker instead. That only works when the marker is seen at an angle;
+  the overhead view refuses with an explanation. On the tripod view it estimates within
+  about 4%, which still gives position errors of about 2 cm or less.
+- If the station marker drifts more than 4 px from where it was calibrated, the panel
+  asks for a recalibration. Changing the camera preset recalibrates automatically.
+- Known error sources (kept on purpose): the body lean shifts the robot marker by up to
+  about 1 cm while it accelerates, and each calibration draws a fresh IMU error.
+
+Physics tests: `node --test tests/simWorld.test.js`. Calibration accuracy for every
+camera preset: `node --test tests/cameraCalibration.test.js`.
 
 ## Placeholder image experiment
 

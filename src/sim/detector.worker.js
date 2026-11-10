@@ -4,7 +4,7 @@ import { createMarkerDetector } from '../utils/markerDetector.js';
 let detector = null;
 self.onmessage = ({ data }) => {
   const { image, family, minPerimeterFraction, simTime, seq } = data;
-  detector ??= createMarkerDetector(family, { minPerimeterFraction });
+  detector ??= createMarkerDetector(family, { minPerimeterFraction, refine: true });
   const t0 = performance.now();
   const markers = detector.detect(image).map((m) => ({ id: m.id, corners: m.corners.map(({ x, y }) => ({ x, y })) }));
   self.postMessage({ markers, ms: performance.now() - t0, simTime, seq });

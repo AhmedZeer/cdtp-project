@@ -44,6 +44,15 @@ export function toStationFrame(station, x, y) {
   return { u: dx * c + dy * s, w: -dx * s + dy * c };
 }
 
+/**
+ * §4.3 approach region in station coordinates: a 90° sector in front of the contact face whose
+ * 30 cm radius is measured from the face (so 0.3 m + half the station depth from its centre).
+ */
+export const APPROACH_RADIUS = 0.3 + STATION.depth / 2;
+export function inApproachRegion(u, w) {
+  return u > STATION.depth / 2 && Math.hypot(u, w) <= APPROACH_RADIUS && Math.abs(Math.atan2(w, u)) <= Math.PI / 4;
+}
+
 /** Distance from the robot body's front face to the station's contact face, and alignment errors. */
 export function dockGeometry(world) {
   const { robot: r, station } = world;

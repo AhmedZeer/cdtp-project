@@ -1,17 +1,11 @@
 // three.js view of the simulation world. Reads world state; never changes it.
 import * as THREE from 'three';
-import { ARENA, ROBOT, STATION, MARKERS, MARKER_FAMILY } from './simConfig.js';
+import { ARENA, ROBOT, STATION, MARKERS, MARKER_FAMILY, MARKER_MOUNTS, RENDER_WIDTH, RENDER_HEIGHT, CAMERA_PRESETS } from './simConfig.js';
 import { drawMarkerCanvas } from './markerTexture.js';
+import { applyCameraPreset } from './cameraRig.js';
+import { APPROACH_RADIUS } from './world.js';
 
-export const RENDER_WIDTH = 1920;
-export const RENDER_HEIGHT = 1080;
-
-// Fixed "phone" poses. Scene coords: x east, y up, z south (world y = -z).
-export const CAMERA_PRESETS = {
-  tripod: { label: 'Phone on tripod (south edge)', position: [0, 1.75, 1.75], target: [0, 0, -0.05], fov: 50 },
-  corner: { label: 'Phone on shelf (corner)', position: [-1.75, 1.7, 1.45], target: [0.1, 0, -0.05], fov: 50 },
-  overhead: { label: 'Overhead (ceiling mount)', position: [0, 2.6, 0.001], target: [0, 0, 0], fov: 60 },
-};
+export { RENDER_WIDTH, RENDER_HEIGHT, CAMERA_PRESETS };
 
 const toScene = (x, y, h = 0) => new THREE.Vector3(x, h, -y);
 
@@ -114,18 +108,18 @@ function buildStation(renderer) {
   edge.position.set(depth / 2 + pad.length / 2, 0.0025, pad.width / 2 - 0.01);
   edge2.position.set(depth / 2 + pad.length / 2, 0.0025, -pad.width / 2 + 0.01);
   const { tower } = STATION;
-  const towerX = -depth / 2 + tower.depth / 2;
+  const towerX = MARKER_MOUNTS.station.forward;
   const back = shadowed(new THREE.Mesh(new THREE.BoxGeometry(tower.depth, tower.height, width), standard('#f8fafc')));
   back.position.set(towerX, tower.height / 2, 0);
   const marker = markerMesh(renderer, 'station');
-  marker.position.set(towerX, tower.height + 0.001, 0);
+  marker.position.set(towerX, MARKER_MOUNTS.station.height, 0);
   // Charging indicator on the tower face, driven by the simulated CHG/STAT line.
   const led = new THREE.Mesh(new THREE.SphereGeometry(0.016, 16, 12), new THREE.MeshStandardMaterial({ color: '#7f1d1d', emissive: '#7f1d1d' }));
   led.position.set(towerX + tower.depth / 2 + 0.006, tower.height - 0.04, width / 2 - 0.05);
   station.add(body, back, contacts, plate, edge, edge2, marker, led);
 
   // §4.3 approach region: 90° sector of 30 cm radius in front of the station (floor marking only).
-  const sector = new THREE.Mesh(new THREE.CircleGeometry(0.3 + depth / 2, 48, -Math.PI / 4, Math.PI / 2),
+  const sector = new THREE.Mesh(new THREE.CircleGeometry(APPROACH_RADIUS, 48, -Math.PI / 4, Math.PI / 2),
     new THREE.MeshBasicMaterial({ color: '#38bdf8', transparent: true, opacity: 0.12, depthWrite: false }));
   sector.rotation.x = -Math.PI / 2; sector.position.y = 0.0015;
   station.add(sector);
@@ -154,15 +148,7 @@ export function createSimScene(canvas) {
   scene.add(robotParts.robot, stationParts.station);
 
   const camera = new THREE.PerspectiveCamera(52, RENDER_WIDTH / RENDER_HEIGHT, 0.05, 30);
-  function setCameraPreset(name) {
-    const p = CAMERA_PRESETS[name] ?? CAMERA_PRESETS.tripod;
-    camera.fov = p.fov;
-    camera.position.set(...p.position);
-    camera.up.set(0, 1, 0);
-    if (name === 'overhead') camera.up.set(0, 0, -1); // image up = north
-    camera.lookAt(...p.target);
-    camera.updateProjectionMatrix();
-  }
+  const setCameraPreset = (name) => applyCameraPreset(camera, name);
   setCameraPreset('tripod');
 
   function sync(world) {

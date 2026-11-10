@@ -37,11 +37,30 @@ export const STATION = {
   chargeDelay: 0.8, // s from stable contact to CHG/STAT asserting
 };
 
+// Where each marker's centre sits: height above the floor and distance ahead of its object's
+// reference point (station centre / robot axle centre) along that object's heading. In the real
+// system these are tape-measure values; the camera calibration uses them to convert pixels to metres.
+export const MARKER_MOUNTS = {
+  station: { height: STATION.tower.height + 0.001, forward: -STATION.depth / 2 + STATION.tower.depth / 2 },
+  robot: { height: ROBOT.body.clearance + ROBOT.body.height + 0.001, forward: 0 },
+  medicine: { height: ROBOT.medicine.liftFromFloor + ROBOT.medicine.height + 0.001, forward: ROBOT.body.depth / 2 + ROBOT.medicine.gap + ROBOT.medicine.depth / 2 },
+};
+
 export const BATTERY = { full: 12.6, empty: 10.8, start: 12.1, drainPerMetre: 0.02, idleDrainPerSec: 0.0005, chargePerSec: 0.01 };
 
 export const INITIAL_POSES = {
   robot: { x: -0.9, y: -0.3, heading: 0 },
   station: { x: 1.15, y: 0.55, heading: Math.PI }, // heading = direction its contact face points
+};
+
+// Virtual phone camera: 1080p frames from fixed poses. Scene coords: x east, y up, z south (world y = -z).
+// fov is the vertical field of view in degrees (three.js convention).
+export const RENDER_WIDTH = 1920;
+export const RENDER_HEIGHT = 1080;
+export const CAMERA_PRESETS = {
+  tripod: { label: 'Phone on tripod (south edge)', position: [0, 1.75, 1.75], target: [0, 0, -0.05], fov: 50 },
+  corner: { label: 'Phone on shelf (corner)', position: [-1.75, 1.7, 1.45], target: [0.1, 0, -0.05], fov: 50 },
+  overhead: { label: 'Overhead (ceiling mount)', position: [0, 2.6, 0.001], target: [0, 0, 0], fov: 60, up: [0, 0, -1] }, // image up = north
 };
 
 export const PHYSICS_HZ = 120;
