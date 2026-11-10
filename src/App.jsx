@@ -4,8 +4,20 @@ import { useCameraVision } from './hooks/useCameraVision';
 import CameraView from './components/CameraView';
 import TelemetryHud from './components/TelemetryHud';
 import TestManager from './components/TestManager';
+import PlaceholderVision from './components/PlaceholderVision';
+import MarkerPlayground from './components/MarkerPlayground';
 
 export default function App() {
+  if (new URLSearchParams(window.location.search).get('scene') === 'playground') {
+    return <MarkerPlayground />;
+  }
+  if (new URLSearchParams(window.location.search).get('scene') === 'placeholder') {
+    return <PlaceholderVision />;
+  }
+  return <LiveApp />;
+}
+
+function LiveApp() {
   const { telemetry, isConnected } = useTelemetry();
   const {
     videoRef,
