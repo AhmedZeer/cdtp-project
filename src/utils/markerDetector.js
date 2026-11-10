@@ -13,25 +13,18 @@ const codes5 = dictionary5.map((bytes) => bytes.map((byte, i) => byte.toString(2
 
 // js-aruco discards contours shorter than 20% of the image width (≈64 px marker sides at
 // 1280 px). `minPerimeterFraction` lowers that so distant markers in a room-wide view qualify.
-// `refine` re-locates each corner to sub-pixel accuracy from the image edges (see cornerRefine.js);
-// needed wherever corners are turned into metric distances.
+// `refine` re-locates each candidate's corners to sub-pixel accuracy from the image edges (see
+// cornerRefine.js) BEFORE the bits are read: needed wherever corners become metric distances, and
+// it lets small markers (≈3–4 px per cell) decode, since coarse corners misplace the cell grid.
 export function createMarkerDetector(family = '6x6_250', { minPerimeterFraction = 0.2, refine = false } = {}) {
-  if (refine) {
-    const base = createMarkerDetector(family, { minPerimeterFraction });
-    return { detect(image) {
-      const markers = base.detect(image);
-      const grey = base.grey ?? base.detectors?.[0]?.detector.grey;
-      return grey ? markers.map((m) => ({ ...m, corners: refineCorners(grey, m.corners) })) : markers;
-    } };
-  }
   if (family === 'catalog') {
-    const detectors = ['6x6_250', '5x5_100', 'legacy'].map((name) => ({ name, detector: createMarkerDetector(name, { minPerimeterFraction }) }));
+    const detectors = ['6x6_250', '5x5_100', 'legacy'].map((name) => ({ name, detector: createMarkerDetector(name, { minPerimeterFraction, refine }) }));
     return { detect(image) {
       return detectors.flatMap(({ name, detector }) => detector.detect(image).map((marker) => ({ ...marker, family: name })));
     } };
   }
   const detector = new AR.Detector();
-  if (minPerimeterFraction !== 0.2) {
+  if (minPerimeterFraction !== 0.2 || refine) {
     detector.detect = function (image) {
       CV.grayscale(image, this.grey);
       CV.adaptiveThreshold(this.grey, this.thres, 2, 7);
@@ -39,7 +32,12 @@ export function createMarkerDetector(family = '6x6_250', { minPerimeterFraction 
       this.candidates = this.findCandidates(this.contours, image.width * minPerimeterFraction, 0.05, 10);
       this.candidates = this.clockwiseCorners(this.candidates);
       this.candidates = this.notTooNear(this.candidates, 10);
-      return this.findMarkers(this.grey, this.candidates, 49);
+      if (!refine) return this.findMarkers(this.grey, this.candidates, 49);
+      // Refined corners are continuous coordinates (pixel centre i + 0.5); js-aruco samples by pixel
+      // index, so shift by half a pixel for decoding and back for the output.
+      const shift = (q, d) => q.map((p) => ({ x: p.x + d, y: p.y + d }));
+      this.candidates = this.candidates.map((c) => shift(refineCorners(this.grey, shift(c, 0.5)), -0.5));
+      return this.findMarkers(this.grey, this.candidates, 49).map((m) => ({ ...m, corners: shift(m.corners, 0.5) }));
     };
   }
   if (family === 'legacy') return detector;
@@ -52,8 +50,10 @@ export function createMarkerDetector(family = '6x6_250', { minPerimeterFraction 
     for (const candidate of candidates) {
       CV.warp(image, this.homography, candidate, cells * 8);
       CV.threshold(this.homography, this.homography, CV.otsu(this.homography));
+      // Read each cell from its central 4×4 of the 8×8 warped pixels: on small or oblique markers
+      // (≈3 px per cell) the cell edges are blurred with the neighbours and would tip the vote.
       const grid = Array.from({ length: cells }, (_, y) => Array.from({ length: cells }, (_, x) =>
-        CV.countNonZero(this.homography, { x: x * 8, y: y * 8, width: 8, height: 8 }) > 32 ? 1 : 0));
+        CV.countNonZero(this.homography, { x: x * 8 + 2, y: y * 8 + 2, width: 4, height: 4 }) > 8 ? 1 : 0));
       if (grid.some((row, y) => row.some((bit, x) => (x === 0 || y === 0 || x === cells - 1 || y === cells - 1) && bit))) continue;
       let bits = grid.slice(1, cells - 1).map((row) => row.slice(1, cells - 1));
       for (let rotation = 0; rotation < 4; rotation++) {

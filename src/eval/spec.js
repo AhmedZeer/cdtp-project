@@ -12,6 +12,8 @@ export const SPEC = {
   initialBalanceS: 5, // §5.3 robot waits balanced for 5 s
   deliveryWaitS: 5, // §8 C5 waits for 5 s without dropping the box
   guidanceStopS: 3, // §8 C1 move ~1 m and stop for 3 s
+  indicatorOffS: 2, // §4.3 / C3.4 indicator off within 2 s of pulling the robot away
+  indicatorOnS: 5, // §4.3 / C3.4 indicator on again within 5 s of returning it
 };
 
 export const ENGINEERING = {
@@ -25,6 +27,7 @@ export const ENGINEERING = {
   maxTrackingGapS: 1, // longer camera dropouts make required observations unavailable
   dock: { frontGapM: 0.04, lateralM: 0.05, headingDeg: 10, holdS: 0.5 }, // camera-side docking test (sim dock: 3 cm / 5 cm / 10°)
   timeLimitS: 180, // cap for tasks the document does not time-limit
+  handoverS: 0.5, // time the robot may take to notice the approach region and take over from the glove
   moveSpeed: 0.05, // m/s: faster than this = moving
   turnRateDeg: 15, // °/s: faster than this = turning
 };
@@ -36,6 +39,8 @@ export const TASKS = [
     summary: 'Drive 0.8–1.2 m in the chosen direction with glove commands, then stop. Ends automatically after a 3 s stop.' },
   { id: 'charging', name: 'Charging', module: 'C', rubric: 'C3',
     summary: 'Start inside the approach region; the robot docks on its own and charging must start within 5 s of docking. Ends once charging is reported.' },
+  { id: 'charging-indicator', name: 'Charging indicator', module: 'C', rubric: 'C3.4',
+    summary: 'Start docked and charging. Pull the robot away by hand: charging must go off within 2 s. Put it back: charging must resume within 5 s. Ends shortly after charging resumes.' },
   { id: 'integrated', name: 'Integrated Task', module: 'E', rubric: 'C5',
     summary: 'Wait balanced 5 s → drive ~1 m and change direction with glove commands → wait 5 s keeping the box → reach the approach region → dock autonomously → charging starts. Ends once charging is reported.' },
 ];

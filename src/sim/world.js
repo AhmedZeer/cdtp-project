@@ -89,21 +89,27 @@ function resolveCollisions(world) {
 
 /**
  * Advance the world by dt seconds.
- * drive: -1 backward, 0 none, +1 forward. Ignored while turning.
+ * drive: -1 backward, 0 none, +1 forward (operator). Ignored while turning.
+ * control: optional { v (m/s), omega (rad/s) } from the robot's own controller (autonomous
+ * docking); it replaces `drive` and any operator turn, within the same speed and acceleration limits.
  */
-export function stepWorld(world, drive, dt) {
+export function stepWorld(world, drive, dt, control = null) {
   const r = world.robot;
   const prevV = r.v;
+  if (control) r.turnTarget = null;
   const turning = r.turnTarget !== null;
 
   // Linear motion: no driving while a turn is executing.
-  const targetV = turning ? 0 : clamp(drive, -1, 1) * ROBOT.maxSpeed;
+  const targetV = control ? clamp(control.v, -ROBOT.maxSpeed, ROBOT.maxSpeed)
+    : turning ? 0 : clamp(drive, -1, 1) * ROBOT.maxSpeed;
   const speedingUp = Math.abs(targetV) > Math.abs(r.v) && targetV * r.v >= 0;
   const rate = speedingUp ? ROBOT.accel : ROBOT.brake;
   r.v = approach(r.v, targetV, rate * dt);
 
   // Rotation: rotate in place once stopped, decelerating into the target heading.
-  if (turning && Math.abs(r.v) < 0.01) {
+  if (control) {
+    r.omega = approach(r.omega, clamp(control.omega, -ROBOT.maxTurnRate, ROBOT.maxTurnRate), ROBOT.turnAccel * dt);
+  } else if (turning && Math.abs(r.v) < 0.01) {
     const err = wrapAngle(r.turnTarget - r.heading);
     const stopping = Math.sqrt(2 * ROBOT.turnAccel * Math.abs(err)); // fastest rate that can still stop on target
     const desired = Math.sign(err) * Math.min(ROBOT.maxTurnRate, stopping);
@@ -152,7 +158,8 @@ export function stepWorld(world, drive, dt) {
   world.battery += world.charging ? BATTERY.chargePerSec * dt : -(BATTERY.idleDrainPerSec * dt + BATTERY.drainPerMetre * moved);
   world.battery = clamp(world.battery, BATTERY.empty, BATTERY.full);
 
-  if (r.turnTarget === null) world.command = drive > 0 ? 'forward' : drive < 0 ? 'backward' : 'stop';
+  if (control) world.command = 'auto';
+  else if (r.turnTarget === null) world.command = drive > 0 ? 'forward' : drive < 0 ? 'backward' : 'stop';
   world.time += dt;
   return world;
 }

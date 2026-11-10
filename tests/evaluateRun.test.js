@@ -153,3 +153,68 @@ test('sealed runs verify, and editing the data or the verdict is detected', asyn
   assert.equal(v.resultMatches, true);
   assert.equal(v.digestMatches, false);
 });
+
+// --- End to end through the simulator controller (autonomous docking, operator lockout) -------
+import { createSimController } from '../src/sim/simController.js';
+
+/** Record a run through the controller. Script steps: { press }, { release }, { wait }, { act }. */
+function runController(taskId, script, { setup = () => {}, rngSeed = 7, limit = 120 } = {}) {
+  let s = rngSeed;
+  const c = createSimController({ rng: () => { s = (s * 16807) % 2147483647; return s / 2147483647; } });
+  setup(c);
+  const rec = createRunRecorder({ task: { id: taskId }, startT: c.world.time });
+  c.subscribe((name, meta) => rec.addCommand(c.world.time, name, meta.ignored));
+  let nextFrame = c.world.time, nextPacket = c.world.time, ended = null;
+  const tick = () => {
+    c.step(1 / 120);
+    const t = c.world.time;
+    if (t >= nextFrame) { nextFrame += 0.1; const o = observe(c.world); rec.addFrame(t, o.robot, o.medicine, c.operatorActive()); }
+    if (t >= nextPacket) { nextPacket += 1; rec.addPacket(t, telemetryPacket(c.world)); }
+    ended ??= rec.autoEnd(t);
+  };
+  for (const step of script) {
+    if (ended) break;
+    if (step.press) c.command(step.press, true);
+    if (step.release) c.command(step.release, false);
+    if (step.act) c[step.act]();
+    const until = c.world.time + (step.wait ?? 0);
+    while (c.world.time < until && !ended) tick();
+  }
+  while (!ended && c.world.time < limit) tick(); // let the robot finish on its own
+  return { record: rec.finish(c.world.time, ended ?? 'user', 'test'), ended, controller: c };
+}
+
+test('charging: placed in the approach region, the robot docks itself and the run passes', () => {
+  const { record, ended } = runController('charging', [], { setup: (c) => { c.placeInApproachRegion(); c.step(1 / 120); } });
+  const r = evaluateRun(record);
+  assert.equal(ended, 'completed');
+  assert.equal(r.status, 'passed', JSON.stringify(r.checks.filter((x) => x.status !== 'passed')));
+});
+
+test('charging: pressing keys while it docks is logged as ignored and still passes', () => {
+  const { record } = runController('charging', [{ wait: 1 }, { press: 'backward', wait: 0.5 }, { release: 'backward' }, { press: 'left' }],
+    { setup: (c) => { c.placeInApproachRegion(); c.step(1 / 120); } });
+  assert.ok(record.commands.length === 2 && record.commands.every((cmd) => cmd.ignored));
+  assert.equal(evaluateRun(record).status, 'passed');
+});
+
+test('charging indicator (C3.4): pull away → off within 2 s, put back → on within 5 s', () => {
+  const { record, ended } = runController('charging-indicator', [{ wait: 2 }, { act: 'pullAway', wait: 4 }, { act: 'putBack' }], {
+    setup: (c) => { c.placeInApproachRegion(); while (!c.world.charging) c.step(1 / 120); },
+  });
+  const r = evaluateRun(record);
+  assert.equal(ended, 'completed');
+  assert.equal(r.status, 'passed', JSON.stringify(r.checks.filter((x) => x.status !== 'passed')));
+});
+
+test('integrated: glove delivery with a turn, 5 s wait, then the robot docks itself — every check passes', () => {
+  const s0 = INITIAL_POSES.station;
+  const { record, ended } = runController('integrated', [
+    { wait: 5.5 }, { press: 'forward', wait: 1.9 }, { release: 'forward', wait: 1 }, { press: 'left', wait: 1.2 },
+    { press: 'forward', wait: 0.95 }, { release: 'forward', wait: 1 }, { press: 'right', wait: 1.2 }, { wait: 6 },
+    { press: 'forward', wait: 3 }, { release: 'forward' }, // head for the dock; the robot takes over in the region
+  ], { setup: (c) => c.reset({ robot: { x: s0.x - 1.45, y: s0.y - 0.3, heading: 0 }, station: s0 }) });
+  const r = evaluateRun(record);
+  assert.equal(ended, 'completed');
+  assert.equal(r.status, 'passed', JSON.stringify(r.checks.filter((x) => x.status !== 'passed')));
+});

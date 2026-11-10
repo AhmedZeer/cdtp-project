@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createSimScene, CAMERA_PRESETS, RENDER_WIDTH, RENDER_HEIGHT } from '../sim/scene3d';
-import { advance, telemetryPacket, dockGeometry, toStationFrame, inApproachRegion, APPROACH_RADIUS, wrapAngle } from '../sim/world';
+import { telemetryPacket, dockGeometry, toStationFrame, inApproachRegion, APPROACH_RADIUS, wrapAngle } from '../sim/world';
 import { presetIntrinsics, upInCamera } from '../sim/cameraRig';
+import { DOCK_STATE_LABELS } from '../sim/autoDock';
 import { createSimController } from '../sim/simController';
 import { ARENA, ROBOT, STATION, MARKERS, MARKER_MOUNTS, MARKER_FAMILY, PHYSICS_HZ, TELEMETRY_HZ, DETECTION_HZ } from '../sim/simConfig';
 import { createStationCalibrator } from '../utils/stationCalibrator';
@@ -47,6 +48,7 @@ function snapshot(controller) {
     turning: r.turnTarget !== null, blocked: r.blocked, command: world.command,
     docked: world.docked, charging: world.charging, battery: world.battery, dock: dockGeometry(world),
     station: { ...world.station }, drive: controller.drive(), simTime: world.time, simSpeed: 1,
+    dockState: controller.dock.state, dockAttempts: controller.dock.attempts, ir: controller.ir,
   };
 }
 
@@ -95,7 +97,9 @@ export default function Simulator3D() {
   const [dropout, setDropoutState] = useState(false);
   const dropoutRef = useRef(false);
   const setDropout = (on) => { dropoutRef.current = on; setDropoutState(on); };
-  useEffect(() => controller.subscribe((name) => runRef.current?.addCommand(controller.world.time, name)), [controller]);
+  useEffect(() => controller.subscribe((name, meta) => runRef.current?.addCommand(controller.world.time, name, meta?.ignored)), [controller]);
+  const [autoDock, setAutoDockState] = useState(controller.autoDock);
+  const setAutoDock = (on) => { controller.setAutoDock(on); setAutoDockState(on); };
   const startRun = (task) => {
     const cal = calibrator.status.cal;
     runRef.current = createRunRecorder({
@@ -171,10 +175,9 @@ export default function Simulator3D() {
 
     function loop(now) {
       const world = controller.world;
-      const drive = controller.drive();
       const elapsed = Math.min(0.25, (now - last) / 1000); // clamp after tab switches / long stalls
       last = now;
-      carry = advance(world, drive, elapsed + carry, stepSeconds);
+      carry = controller.advance(elapsed + carry, stepSeconds); // physics + onboard IR/docking controller
       sim.sync(world);
       sim.render();
 
@@ -193,7 +196,7 @@ export default function Simulator3D() {
         nextTelemetry = world.time + 1 / TELEMETRY_HZ;
         if (!dropoutRef.current) { // "Simulate telemetry dropout" withholds packets, like a lost Wi-Fi link
           const packet = telemetryPacket(world, (Math.random() - 0.5) * 0.2);
-          latestPacketRef.current = { ...packet, simTime: world.time };
+          latestPacketRef.current = { ...packet, mode: controller.dock.state, simTime: world.time }; // the robot also reports its docking mode
           setTelemetry(latestPacketRef.current);
           runRef.current?.addPacket(world.time, packet);
         }
@@ -267,6 +270,13 @@ export default function Simulator3D() {
               <label><input type="radio" checked={mode === 'latched'} onChange={() => setMode('latched')} /> Glove-style (latched until Stop)</label>
             </fieldset>
             <label className="mb-2 block"><input type="checkbox" checked={dropout} onChange={(e) => setDropout(e.target.checked)} /> Simulate telemetry dropout (robot stops sending packets)</label>
+            <label className="mb-2 block"><input type="checkbox" checked={autoDock} onChange={(e) => setAutoDock(e.target.checked)} /> Autonomous docking (robot takes over in the approach region)</label>
+            <div className="mb-2 flex flex-wrap gap-2">
+              <span className="w-full text-slate-500">By hand (a person moving the robot):</span>
+              <button className="rounded bg-slate-700 px-2 py-1 font-semibold hover:bg-slate-600" onClick={(e) => { controller.placeInApproachRegion(); e.currentTarget.blur(); }}>Place in approach region</button>
+              <button className="rounded bg-slate-700 px-2 py-1 font-semibold hover:bg-slate-600" onClick={(e) => { controller.pullAway(); e.currentTarget.blur(); }}>Pull away from dock</button>
+              <button className="rounded bg-slate-700 px-2 py-1 font-semibold hover:bg-slate-600" onClick={(e) => { controller.putBack(); e.currentTarget.blur(); }}>Put back on dock</button>
+            </div>
             <button disabled={running} className="rounded bg-slate-700 px-3 py-2 font-semibold hover:bg-slate-600 disabled:opacity-50" onClick={(e) => { resetRobot(); e.currentTarget.blur(); }}>Reset robot</button>
             {running && <span className="ml-2 text-slate-500">Camera and reset are locked during a test.</span>}
           </Panel>
@@ -291,6 +301,8 @@ export default function Simulator3D() {
 
           <CalibrationPanel locked={running} calibration={calibration} settings={calSettings} onSettings={setCalSettings} onRecalibrate={recalibrate}
             metric={metric} truthStation={truthStation} />
+
+          <DockingPanel truth={truth} />
 
           <Panel title="Robot telemetry (1 Hz, ESP32 packet format)">
             {telemetry ? <dl className="grid grid-cols-3 gap-2">
@@ -395,6 +407,27 @@ function Controls({ mode, command, driveLabel }) {
         <p>{mode === 'hold' ? 'Hold a drive key to move; release to brake.' : `Glove-style: a drive command latches until Stop. Current: ${driveLabel}.`} Turns run in place and finish before driving resumes.</p>
       </div>
     </div>
+  );
+}
+
+/** What the robot's onboard docking controller sees and does (IR receivers, state machine). */
+function DockingPanel({ truth }) {
+  const ir = truth.ir;
+  const chip = (on, label) => <span className={`rounded px-1.5 py-0.5 font-mono ${on ? 'bg-cyan-700 text-white' : 'bg-slate-800 text-slate-500'}`}>{label}</span>;
+  const active = !['idle', 'docked', 'failed'].includes(truth.dockState);
+  return (
+    <Panel title="Onboard IR docking (robot side)">
+      <p className={`mb-2 font-semibold ${truth.dockState === 'docked' ? 'text-emerald-400' : truth.dockState === 'failed' ? 'text-red-400' : active ? 'text-cyan-300' : 'text-slate-300'}`}>
+        {DOCK_STATE_LABELS[truth.dockState]}{active && truth.dockAttempts > 1 && ` (attempt ${truth.dockAttempts})`}
+        {active && <span className="font-normal text-slate-400"> · glove commands are ignored</span>}
+      </p>
+      {ir && <div className="flex flex-wrap items-center gap-2">
+        <span className="text-slate-500">Top receiver:</span>{chip(ir.omni.L, 'L beam')}{chip(ir.omni.R, 'R beam')}{chip(ir.omni.F, 'field')}
+        <span className="ml-2 text-slate-500">Front:</span>
+        <span className="font-mono">{ir.front.visible ? `${fmt(deg(ir.front.bearing), 0)}° · ${fmt(ir.front.range * 100, 0)} cm` : 'no signal'}</span>
+      </div>}
+      <p className="mt-2 text-slate-500">The station's L and R beams overlap only on its centre line; its short-range field covers the approach region. The robot steers with these, its gyro and a bumper, never with the camera or true positions.</p>
+    </Panel>
   );
 }
 

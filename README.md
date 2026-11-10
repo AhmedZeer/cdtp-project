@@ -46,8 +46,26 @@ DICT_5X5_100):
 | Object | Marker ID | Black-square size |
 | --- | ---: | ---: |
 | Charging station (on its raised back tower) | 0 | 15 cm |
-| Robot body (top) | 1 | 14 cm |
+| Robot body (top) | 1 | 10 cm |
 | Medicine box (top) | 2 | 10 cm |
+
+Sizes (in `src/sim/simConfig.js`):
+
+| Object | Size |
+| --- | --- |
+| Robot body | 24 cm wide × 13 cm deep × 30 cm tall, top at 34 cm; 12 cm wheels |
+| Medicine box | 13 × 14 × 8 cm on a front tray, top flush with the body, so the robot with its box is about 27 cm long |
+| Charging station | 28 cm wide × 35 cm deep: a 12 cm-high front section and a 40 cm-high marker tower |
+| Floor pad | 22 × 32 cm in front of the station; it holds both wheels of a docked robot |
+
+The station is as small as two constraints allow. The tower top has to hold the 15 cm
+marker plus its white border (19.3 cm), and the low front section has to be longer than
+the docked robot's medicine-box overhang (13.6 cm). Making it smaller would need a
+smaller station marker, which makes the camera calibration less accurate.
+
+The robot is tall and thin like a typical self-balancing robot. Its depth is set by the
+10 cm robot marker, which needs a 12.9 cm square on top of the body. The tower stays
+taller than the robot (40 cm vs 34 cm) so a docked robot cannot hide the station marker.
 
 A fixed virtual **phone camera** renders the arena at 1920×1080. Three mounts are
 available: tripod at the south edge, shelf in a corner, and overhead. The detector
@@ -59,12 +77,15 @@ converts them to metres (below).
 
 The simulator's detector refines each corner to sub-pixel accuracy
 (`src/utils/cornerRefine.js`). js-aruco's own corners are whole pixels and sit inside
-the true outline: about 1 px on the station marker and 4 px on the closer robot marker.
+the true outline, by about 1–4 px depending on marker size.
 That error is systematic, so it scales every distance. The refinement finds the steepest
 dark-to-light step across each edge (after undoing sRGB gamma), fits a line to each edge
 and intersects neighbouring lines. On the rendered frames this reduces corner error to
-about 0.4 px with no inward bias. It is the detector option `refine: true`; the live
-camera page does not use it yet.
+about 0.4 px with no inward bias. Corners are refined before the marker bits are read,
+not after. With only 3–4 px per cell, the coarse corners shift the sampling grid enough
+to misread small or oblique markers, and refining first fixes that. Each cell is also
+read from its central 4×4 of the 8×8 warped pixels, away from blurred cell edges. It is
+the detector option `refine: true`; the live camera page does not use it yet.
 
 ### Controls
 
@@ -97,7 +118,50 @@ waits until the turn has finished.
   30 cm radius is measured from the contact face, which is this simulator's
   interpretation of "30 cm-radius area centred on the station".
 - A telemetry packet in the same `{ tilt, battery, charging }` shape as `mock-esp32.js` is
-  produced at 1 Hz.
+  produced at 1 Hz. It also carries `mode`, the robot's docking state, which is shown as
+  *Robot mode* in the status bar.
+
+### Autonomous docking (§4.3)
+
+When the robot enters the approach region, its onboard controller takes over and docks
+it with no human input. From then until it has docked, glove and keyboard commands are
+ignored (and logged as ignored). The controller only uses what a real robot has
+(`src/sim/irSensors.js`, `src/sim/autoDock.js`). It never sees the camera's view or the
+true positions:
+
+- **Station IR**, laid out like a robot-vacuum dock. A left and a right beam come from the
+  centre of the contact face (±80°, 1.8 m). They overlap only within ±2° of the centre
+  line. A short-range field covers exactly the approach region.
+- **Robot IR:**
+  - a receiver on top reports which of L, R and the field it hears;
+  - a pair of receivers on the front reports the bearing to the emitter (±60°, 1.5°
+    noise) and a rough range (±8%);
+  - 3% of readings drop out.
+- **Other robot sensors:** its gyro heading, wheel odometry, a front bumper, and the
+  voltage on its charging contacts. Voltage appears only when the contacts line up,
+  that is, when the robot is docked.
+
+The controller's steps:
+1. Spin until the front receivers see the emitter, then face it.
+2. If only one beam is heard, turn 90° towards the centre line and drive across until both
+   beams are heard, then face the emitter again.
+3. Drive in, keeping the emitter ahead and nudging back towards the centre line if one
+   beam drops.
+4. Stop on the bumper. If the contacts show no voltage within 1 s, the robot is
+   misaligned: back off 25 cm and try again (up to 4 attempts, 90 s limit).
+
+The **Onboard IR docking** panel shows the state, the receiver readings and the attempt
+count. In 200 random placements across the whole region, facing any direction, every
+run docked and charged (median 17 s, worst 27 s).
+
+**By hand** (Setup) has three actions, standing in for a person moving the robot:
+- *Place in approach region:* a random pose in the region, facing any direction. Docking
+  starts at once.
+- *Pull away from dock* and *Put back on dock:* for the C3.4 indicator test. A robot
+  that has been pulled away does not re-dock by itself until it has left the region and
+  entered it again.
+
+The *Autonomous docking* toggle turns the takeover off.
 
 Everything runs on a simulation clock. If a device renders too slowly, the simulation
 runs in slow motion rather than skipping time, and the **Sim speed** readout drops below
@@ -107,9 +171,8 @@ at about 1×.
 The ground-truth panel and top-down mini-map show simulator state that the app would
 not see in reality. They are for checking the camera-based measurements against.
 
-Known visibility limits (real occlusion and resolution effects, kept on purpose): the
-medicine box can be missed when the robot is in a far corner at an angle, or when the
-body hides it from the corner camera.
+Known visibility limit (a real resolution effect, kept on purpose): from the tripod, the
+markers are too small to read when the robot is in the far south-east corner.
 
 ### Metric calibration
 
@@ -135,10 +198,10 @@ robot, and *Error vs truth* compares the two.
   of corner noise into errors of tens of centimetres. With it, simulated tests show a
   mean error of about 1–3 cm and a 1 m move measured within about ±3 cm. The simulator
   adds ±0.3° of IMU error.
-- Measured live on rendered frames with sub-pixel corners and known focal length, at 8
-  robot poses per view: tripod 0.3–1.4 cm, corner shelf 0.4–1.6 cm, overhead 0.2–0.4 cm.
-  Heading error was at most 0.4° in every view. From the tripod, the robot is not
-  detected at all in the two far corners.
+- Measured live on rendered frames with sub-pixel corners, known focal length and the
+  10 cm robot marker, at 8 robot poses per view: tripod 0.3–1.3 cm, corner shelf
+  0.2–1.7 cm, overhead 0.2–0.5 cm. Heading error was at most 0.9°. Every pose was
+  detected except one far corner from the tripod.
 - **Focal length:** this defaults to the camera's known intrinsics (the simulator's
   equivalent of a phone's factory calibration). *Estimate focal length* derives it from
   the station marker instead. That only works when the marker is seen at an angle;
@@ -170,6 +233,7 @@ independent of the simulator, so the live phone page can feed it the same record
 | Static Balance (A) | at 30 s | 30 ± 2 s; stayed within 5 cm of the start |
 | Robot Guidance (B) | after ≥ 0.5 m of travel and a 3 s stop | 0.8–1.2 m start to end; within 20° of the commanded axis; a matching command was issued |
 | Charging (C) | 1 s after charging is reported at the dock | started inside the approach region; docked (camera: front gap ≤ 4 cm, lateral ≤ 5 cm, angle ≤ 10°, held 0.5 s); no operator input from start to docking; charging reported ≤ 5 s after docking |
+| Charging indicator (C3.4) | 1 s after charging resumes | charging at the start; the camera sees the robot leave the dock; charging reported off ≤ 2 s later; robot back on the dock; charging reported on ≤ 5 s later |
 | Integrated (E) | as Charging | waited 5 s in place; drove 0.8–1.2 m (path) with a ≥ 60° turn; held still 5 s (the delivery point); then reached the approach region, docked autonomously and started charging within 5 s |
 
 Every task also checks: camera tracking (no gap over 1 s), the telemetry link (no
@@ -181,10 +245,15 @@ evidence is missing. The run history lists every run and adds up C5 over the lat
 four integrated runs.
 
 **Autonomy evidence:** a run fails "Autonomous docking" if, between entering the
-approach region (or Start Test, for Charging) and docking, a command was issued or
+approach region (or Start Test, for Charging) and docking, a command was acted on or
 operator input was still driving the robot. A latched glove-style forward started
-earlier still counts. The simulator has no autonomous docking yet, so a robot driven
-into the dock by hand fails this check, as it would in the real test.
+earlier still counts. The robot gets 0.5 s to notice the region and take over (an app
+threshold). Commands it ignored because it was docking itself do not count. Driving
+into the dock by hand, with *Autonomous docking* off, fails this check, as it would in
+the real test.
+
+All five tasks have passed live in the simulator, with the robot docking itself for
+Charging and Integrated.
 
 **Tamper evidence:** each finished run is sealed. That is a SHA-256 digest over the full
 record (every camera frame, telemetry packet and command, with timestamps) and its
@@ -197,7 +266,9 @@ record is the §5.2 alternative.
 exercised.
 
 Evaluation tests: `node --test tests/evaluateRun.test.js tests/motionState.test.js`.
-These drive the simulator physics through scripted runs of each task.
+These drive the simulator physics through scripted runs of each task, including full
+runs through the controller with autonomous docking. Docking tests:
+`node --test tests/autoDock.test.js`.
 
 Physics tests: `node --test tests/simWorld.test.js`. Calibration accuracy for every
 camera preset: `node --test tests/cameraCalibration.test.js`.

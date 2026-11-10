@@ -118,11 +118,22 @@ function buildStation(renderer) {
   led.position.set(towerX + tower.depth / 2 + 0.006, tower.height - 0.04, width / 2 - 0.05);
   station.add(body, back, contacts, plate, edge, edge2, marker, led);
 
-  // §4.3 approach region: 90° sector of 30 cm radius in front of the station (floor marking only).
+  // §4.3 approach region: the 90° sector reaching 30 cm out from the contact face (see
+  // inApproachRegion). Drawn just above the pad so the pad does not hide it, with an outline.
+  // Autonomous docking starts from here; charging starts at the contact face itself.
   const sector = new THREE.Mesh(new THREE.CircleGeometry(APPROACH_RADIUS, 48, -Math.PI / 4, Math.PI / 2),
-    new THREE.MeshBasicMaterial({ color: '#38bdf8', transparent: true, opacity: 0.12, depthWrite: false }));
-  sector.rotation.x = -Math.PI / 2; sector.position.y = 0.0015;
-  station.add(sector);
+    new THREE.MeshBasicMaterial({ color: '#38bdf8', transparent: true, opacity: 0.22, depthWrite: false }));
+  sector.rotation.x = -Math.PI / 2; sector.position.y = 0.006;
+  const outline = [];
+  const faceCut = depth / 2; // the sector's ±45° edges leave the station body at the contact face
+  outline.push(new THREE.Vector3(faceCut, 0.007, -faceCut));
+  for (let k = 0; k <= 32; k++) {
+    const a = -Math.PI / 4 + (k / 32) * (Math.PI / 2);
+    outline.push(new THREE.Vector3(APPROACH_RADIUS * Math.cos(a), 0.007, -APPROACH_RADIUS * Math.sin(a)));
+  }
+  outline.push(new THREE.Vector3(faceCut, 0.007, faceCut));
+  const edge3 = new THREE.Line(new THREE.BufferGeometry().setFromPoints(outline), new THREE.LineBasicMaterial({ color: '#0ea5e9' }));
+  station.add(sector, edge3);
   return { station, led };
 }
 

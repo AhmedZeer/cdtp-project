@@ -6,7 +6,7 @@ export const MARKER_FAMILY = '5x5_100';
 
 export const MARKERS = {
   station: { id: 0, size: 0.15 },
-  robot: { id: 1, size: 0.14 },
+  robot: { id: 1, size: 0.1 }, // 12.9 cm with its white border: sets the minimum body depth
   medicine: { id: 2, size: 0.1 },
 };
 
@@ -15,8 +15,9 @@ export const ARENA = { width: 3.2, depth: 2.6 }; // floor rectangle centred on t
 export const ROBOT = {
   wheelRadius: 0.06,
   wheelWidth: 0.03,
-  body: { depth: 0.2, width: 0.24, height: 0.22, clearance: 0.04 }, // clearance = floor to body bottom
-  medicine: { depth: 0.13, width: 0.14, height: 0.08, liftFromFloor: 0.18, gap: 0.006 }, // top flush with the body so neither marker hides the other
+  // Tall and thin like a typical self-balancing robot; the top must still hold the robot marker.
+  body: { depth: 0.13, width: 0.24, height: 0.3, clearance: 0.04 }, // clearance = floor to body bottom; top at 34 cm
+  medicine: { depth: 0.13, width: 0.14, height: 0.08, liftFromFloor: 0.26, gap: 0.006 }, // top flush with the body so neither marker hides the other
   maxSpeed: 0.35, // m/s
   accel: 0.8, // m/s^2
   brake: 1.4, // m/s^2
@@ -28,9 +29,13 @@ export const ROBOT = {
 ROBOT.track = ROBOT.body.width + ROBOT.wheelWidth; // wheel centre to wheel centre
 
 export const STATION = {
-  depth: 0.36, width: 0.4, height: 0.12, // low front section: the docked robot's medicine box overhangs it
-  tower: { depth: 0.2, height: 0.3 }, // raised back section carrying the marker, taller than the robot so a docked robot cannot hide it
-  pad: { length: 0.36, width: 0.34 }, // floor plate in front of the station
+  // Sized down to the smallest the two constraints allow: the tower top must hold the 15 cm marker
+  // plus its white border (19.3 cm), and the low front section must be longer than the docked
+  // robot's medicine-box overhang (13.6 cm). A smaller station needs a smaller station marker,
+  // which makes the camera calibration less accurate.
+  depth: 0.35, width: 0.28, height: 0.12, // low front section: the docked robot's medicine box overhangs it
+  tower: { depth: 0.2, height: 0.4 }, // raised back section carrying the marker, taller than the robot (34 cm) so a docked robot cannot hide it
+  pad: { length: 0.22, width: 0.32 }, // floor plate in front of the station: holds both wheels of a docked robot
   dockDepthTolerance: 0.03, // body front must be within this of the contact face
   dockLateralTolerance: 0.05,
   dockHeadingTolerance: (10 * Math.PI) / 180,

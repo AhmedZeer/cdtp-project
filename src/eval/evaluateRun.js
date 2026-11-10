@@ -6,7 +6,7 @@
 //   frames:   [{ t, robot: { u, w, heading, frontGap, headingError, inApproach } | null, medicine: { onRobot } | null,
 //               operator?: boolean }],   // operator input driving the robot at that moment (latched/held drive, turn)
 //   packets:  [{ t, tilt, charging, battery }],      // robot telemetry as received
-//   commands: [{ t, name }] | null,                  // operator commands; null = source does not report them
+//   commands: [{ t, name, ignored? }] | null,        // operator commands (ignored = robot was docking itself); null = not reported
 // }
 // Times are seconds since Start Test. Positions are metres in the station frame
 // (u out of the contact face, w to its left).
@@ -149,7 +149,7 @@ export function evaluateRun(record) {
     if (record.commands === null) add('Glove commands', 'skipped', 'The command source does not report commands to the app.');
     else {
       const wanted = record.task.direction === 'backward' ? 'backward' : 'forward';
-      const used = record.commands.some((c) => c.name === wanted);
+      const used = record.commands.some((c) => c.name === wanted && !c.ignored);
       add('Glove commands', used ? 'passed' : 'failed', used ? `A ${wanted} command was issued.` : `No ${wanted} command was issued during the test.`);
     }
     return result();
@@ -164,16 +164,19 @@ export function evaluateRun(record) {
     if (dock === null) { add('Charging start', 'failed', 'Charging cannot start without docking.'); return; }
     // Human guidance = a command issued in the window, or operator input still driving the robot
     // (a latched or held drive started earlier counts too).
-    const windowFrames = frames.filter((f) => f.t >= autonomyFrom && f.t <= dock);
+    // The robot gets a short handover after entering the region to notice it and take over.
+    const windowStart = autonomyFrom + ENGINEERING.handoverS;
+    const windowFrames = frames.filter((f) => f.t >= windowStart && f.t <= dock);
     const driven = windowFrames.filter((f) => f.operator === true);
     const known = windowFrames.some((f) => typeof f.operator === 'boolean');
     if (record.commands === null && !known) add('Autonomous docking', 'skipped', 'Neither commands nor operator activity are reported to the app.');
     else {
-      const guided = (record.commands ?? []).filter((c) => c.t >= autonomyFrom && c.t <= dock);
+      // Commands the robot ignored because it was docking itself are not guidance.
+      const guided = (record.commands ?? []).filter((c) => c.t >= windowStart && c.t <= dock && !c.ignored);
       const human = guided.length > 0 || driven.length > 0;
       add('Autonomous docking', human ? 'failed' : 'passed', human
         ? `Operator input drove the robot between ${f2(autonomyFrom, 1)} s and docking (${guided.length} new command(s), ${f2(driven.length * 0.1, 1)} s of active drive); docking must happen without human or glove guidance (§4.3).`
-        : 'No operator input from the approach region to docking (§4.3).');
+        : `No operator input from the approach region to docking (§4.3; ${ENGINEERING.handoverS} s handover allowed).`);
     }
     const charged = packets.find((p) => p.charging && p.t >= dock);
     metrics.chargingDelayS = charged ? charged.t - dock : null;
@@ -181,6 +184,30 @@ export function evaluateRun(record) {
       ? `Charging reported ${f2(charged.t - dock, 1)} s after docking; limit ${SPEC.chargeDeadlineS} s (§4.3). Telemetry arrives at 1 Hz, so this includes up to 1 s of reporting delay.`
       : 'Charging was never reported after docking.');
   };
+
+  if (task.id === 'charging-indicator') {
+    // C3.4: charging on at the start → pulled off the dock → off within 2 s → put back → on within 5 s.
+    const first = packets[0];
+    add('Charging at start', first?.charging ? 'passed' : 'failed', first?.charging ? 'Charging was reported at the start.' : 'Start the test with the robot docked and charging.');
+    const pulled = seen.find((f) => !isDocked(f.robot));
+    metrics.pulledAtS = pulled?.t ?? null;
+    if (!pulled) { add('Pulled away', 'failed', 'The camera never saw the robot leave the dock.'); return result(); }
+    add('Pulled away', 'passed', `Robot left the dock at ${f2(pulled.t, 1)} s.`);
+    const off = packets.find((p) => p.t >= pulled.t && !p.charging);
+    metrics.offDelayS = off ? off.t - pulled.t : null;
+    add('Indicator off', off && off.t - pulled.t <= SPEC.indicatorOffS ? 'passed' : 'failed', off
+      ? `Charging reported off ${f2(off.t - pulled.t, 1)} s after leaving the dock; limit ${SPEC.indicatorOffS} s (§4.3). Includes up to 1 s of 1 Hz reporting delay.`
+      : 'Charging was never reported off after the robot left the dock.');
+    const back = dockTime(frames, pulled.t);
+    metrics.returnedAtS = back;
+    if (back === null) { add('Indicator on again', 'failed', 'The robot was not seen back on the dock.'); return result(); }
+    const on = packets.find((p) => p.t >= back && p.charging);
+    metrics.onDelayS = on ? on.t - back : null;
+    add('Indicator on again', on && on.t - back <= SPEC.indicatorOnS ? 'passed' : 'failed', on
+      ? `Back on the dock at ${f2(back, 1)} s; charging reported ${f2(on.t - back, 1)} s later; limit ${SPEC.indicatorOnS} s (§4.3).`
+      : 'Charging was never reported after the robot was put back.');
+    return result();
+  }
 
   if (task.id === 'charging') {
     const first = seen[0];

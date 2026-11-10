@@ -10,6 +10,11 @@ const STATUS_STYLE = {
   inconclusive: 'border-amber-600/60 bg-amber-950/40 text-amber-200',
 };
 const CHECK_ICON = { passed: ['✓', 'text-emerald-400'], failed: ['✗', 'text-red-400'], unavailable: ['?', 'text-amber-400'], skipped: ['–', 'text-slate-500'] };
+const TASK_HINTS = {
+  charging: 'Setup → “Place in approach region”, then Start Test. The robot docks by itself; glove commands are ignored meanwhile.',
+  'charging-indicator': 'Let the robot dock and start charging first. Then Start Test, and use Setup → “Pull away from dock”, wait, then “Put back on dock”.',
+  integrated: 'Wait 5 s, drive about 1 m with a turn, stop 5 s, then head for the station: the robot takes over in the approach region.',
+};
 const DIRECTION_ARROW = { forward: '↑ forward', backward: '↓ backward', left: '⟲ left', right: '⟳ right' };
 
 /** §5.2: motion state, direction, tilt, charging and link shown live, plus the test timer. */
@@ -17,12 +22,14 @@ export function LiveStatusBar({ motion, telemetry, linkSilenceS, run }) {
   const lost = linkSilenceS > SPEC.linkMaxGapS;
   const item = 'flex flex-col rounded bg-slate-900 px-3 py-1.5';
   return (
-    <div className="mt-2 grid grid-cols-2 gap-1 text-xs sm:grid-cols-5" aria-live="polite">
+    <div className="mt-2 grid grid-cols-2 gap-1 text-xs sm:grid-cols-6" aria-live="polite">
       <div className={item}><span className="text-slate-500">Motion (camera)</span>
         <span className="font-semibold">{MOTION_LABELS[motion.state] ?? '—'}{motion.direction && <span className="text-cyan-300"> · {DIRECTION_ARROW[motion.direction]}</span>}</span></div>
       <div className={item}><span className="text-slate-500">Tilt</span><span className="font-mono">{telemetry ? `${fmt(telemetry.tilt)}°` : '—'}</span></div>
       <div className={item}><span className="text-slate-500">Charging</span>
         <span className={telemetry?.charging ? 'font-semibold text-emerald-400' : ''}>{telemetry ? (telemetry.charging ? 'YES' : 'no') : '—'}</span></div>
+      <div className={item}><span className="text-slate-500">Robot mode</span>
+        <span className={telemetry?.mode && telemetry.mode !== 'idle' ? 'font-semibold text-cyan-300' : ''}>{!telemetry?.mode ? '—' : telemetry.mode === 'idle' ? 'manual' : telemetry.mode === 'docked' ? 'docked' : telemetry.mode === 'failed' ? 'dock failed' : 'auto-docking'}</span></div>
       <div className={item}><span className="text-slate-500">Robot link</span>
         <span className={lost ? 'font-semibold text-red-400' : 'text-emerald-400'}>{linkSilenceS === null ? 'waiting' : lost ? `LOST ${fmt(linkSilenceS)} s` : 'connected'}</span></div>
       <div className={item}><span className="text-slate-500">Test timer</span>
@@ -67,7 +74,7 @@ export default function EvaluationPanel({ ready, notReadyReason, run, runTask, o
           </select>
         </label>}
         <p className="mb-2 text-slate-400">{task.summary}</p>
-        {(taskId === 'charging' || taskId === 'integrated') && <p className="mb-2 text-amber-300">The simulator has no autonomous docking yet. Driving into the dock yourself fails “Autonomous docking”, as it would in the real test.</p>}
+        {TASK_HINTS[taskId] && <p className="mb-2 text-cyan-200">{TASK_HINTS[taskId]}</p>}
         <button disabled={!ready} className="w-full rounded-lg bg-emerald-500 px-3 py-2 font-bold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
           onClick={(e) => { onStart({ id: taskId, ...(taskId === 'robot-guidance' ? { direction } : {}) }); setOpenIndex(0); e.currentTarget.blur(); }}>
           ▶ Start Test

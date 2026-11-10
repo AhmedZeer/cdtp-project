@@ -4,7 +4,7 @@
 // Floor frame F (metres): origin on the floor directly below the station marker's centre,
 // +X = the marker's +X (out of the station's contact face), +Y = 90° to its left, +Z up.
 // Other markers are located by intersecting their pixels' viewing rays with the horizontal
-// plane at their own known height, so a robot marker 26 cm up is not mistaken for one on the floor.
+// plane at their own known height, so a robot marker 34 cm up is not mistaken for one on the floor.
 //
 // Pixels: x right, y down. Marker corners use the detector's canonical order: corner 0 → 1 is
 // the marker's +X, corner 0 → 3 is image-down in the marker's own texture (so −Y in F).
