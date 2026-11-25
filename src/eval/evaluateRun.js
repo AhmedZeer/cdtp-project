@@ -82,6 +82,10 @@ export function evaluateRun(record) {
   };
   if (!task) { add('Task', 'unavailable', `Unknown task "${record.task.id}".`); return result(); }
 
+  if (['camera-source-changed', 'camera-resolution-changed', 'configuration-changed', 'camera-moved'].includes(record.endReason)) {
+    add('Continuous camera setup', 'unavailable', 'The camera moved or its source, resolution or configuration changed during this run. Recalibrate and start a new test.', 'engineering');
+  }
+
   // --- Evidence common to every task -------------------------------------------------------
   metrics.durationS = T;
   metrics.trackedFraction = frames.length ? seen.length / frames.length : 0;
@@ -146,7 +150,7 @@ export function evaluateRun(record) {
       `Moved ${f2(travelled)} m start to end; required ${SPEC.guidanceMinM}–${SPEC.guidanceMaxM} m (§5.2).`);
     add('Direction', along > 0 && offAxis <= ENGINEERING.directionToleranceDeg ? 'passed' : 'failed',
       `Commanded ${record.task.direction ?? 'forward'}; motion was ${f2(offAxis, 0)}° off that axis (limit ${ENGINEERING.directionToleranceDeg}°)${along <= 0 ? ', in the opposite direction' : ''}.`, 'engineering');
-    if (record.commands === null) add('Glove commands', 'skipped', 'The command source does not report commands to the app.');
+    if (record.commands === null) add('Glove commands', record.meta?.source === 'phone' ? 'unavailable' : 'skipped', 'The command source does not report commands to the app.');
     else {
       const wanted = record.task.direction === 'backward' ? 'backward' : 'forward';
       const used = record.commands.some((c) => c.name === wanted && !c.ignored);
@@ -169,7 +173,9 @@ export function evaluateRun(record) {
     const windowFrames = frames.filter((f) => f.t >= windowStart && f.t <= dock);
     const driven = windowFrames.filter((f) => f.operator === true);
     const known = windowFrames.some((f) => typeof f.operator === 'boolean');
-    if (record.commands === null && !known) add('Autonomous docking', 'skipped', 'Neither commands nor operator activity are reported to the app.');
+    if (record.meta?.source === 'phone' && (!known || windowFrames.some((f) => typeof f.operator !== 'boolean'))) {
+      add('Autonomous docking', 'unavailable', 'Continuous physical operator-activity evidence is required to verify autonomous docking.');
+    } else if (record.commands === null && !known) add('Autonomous docking', record.meta?.source === 'phone' ? 'unavailable' : 'skipped', 'Neither commands nor operator activity are reported to the app.');
     else {
       // Commands the robot ignored because it was docking itself are not guidance.
       const guided = (record.commands ?? []).filter((c) => c.t >= windowStart && c.t <= dock && !c.ignored);
@@ -247,6 +253,7 @@ export function evaluateRun(record) {
   add('Changed direction', turned >= ENGINEERING.turnChangeDeg ? 'passed' : 'failed',
     `Largest heading change during the leg ${f2(turned, 0)}°; at least ${ENGINEERING.turnChangeDeg}° required (§5.3 "changes direction").`, 'engineering');
   add('5 s wait at delivery point', 'passed', `Held position for ${SPEC.deliveryWaitS} s from ${f2(delivery, 1)} s (§8 C5).`);
+  if (record.commands === null && record.meta?.source === 'phone') add('Glove commands', 'unavailable', 'The physical command source does not report commands to the app.');
   if (record.commands !== null) {
     const glove = record.commands.some((c) => c.t >= legStart && c.t <= delivery && c.name !== 'stop');
     add('Glove commands', glove ? 'passed' : 'failed', glove ? 'The delivery leg was driven by operator commands.' : 'No drive commands were issued during the delivery leg.');

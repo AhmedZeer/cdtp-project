@@ -1,19 +1,41 @@
+import { DASHBOARD_MAX_BYTES } from './phoneDashboard.js';
+
 export function readCameraRoom() {
   const room = new URLSearchParams(window.location.search).get('cameraRoom');
   return /^[a-f0-9]{32}$/.test(room ?? '') ? room : null;
 }
 
 /** One-way video, with sender-created offers and fresh peer connections after each reconnect. */
-export function connectPhoneCamera({ role, room, stream = null, onStatus, onStream = () => {}, onError }) {
-  let stopped = false, socket, peer = null, session = null, candidates = [], remoteStream = null;
-  let reconnectTimer, retryTimer, negotiationTimer;
+export function connectPhoneCamera({ role, room, stream = null, onStatus, onStream = () => {}, onError, onData = () => {}, onDataStatus = () => {} }) {
+  let stopped = false, socket, channel = null, peer = null, session = null, candidates = [], remoteStream = null;
+  let reconnectTimer, retryTimer, negotiationTimer, dashboardRelay = false;
   let backoff = 1000;
   const send = (message) => {
     if (!stopped && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ ...message, session }));
   };
+  const bindChannel = (next) => {
+    if (next.label !== 'evaluation') { next.close(); return; }
+    channel = next;
+    next.onopen = () => { if (!stopped && channel === next) onDataStatus(true); };
+    next.onclose = next.onerror = () => { if (channel === next) onDataStatus(false); };
+    next.onmessage = ({ data }) => {
+      if (stopped || channel !== next || typeof data !== 'string' || data.length > DASHBOARD_MAX_BYTES) return;
+      let message;
+      try { message = JSON.parse(data); } catch { return; }
+      onData(message);
+    };
+  };
   const resetPeer = () => {
     clearTimeout(retryTimer);
     clearTimeout(negotiationTimer);
+    const previousChannel = channel;
+    channel = null;
+    dashboardRelay = false;
+    onDataStatus(false);
+    if (previousChannel) {
+      previousChannel.onopen = previousChannel.onclose = previousChannel.onerror = previousChannel.onmessage = null;
+      previousChannel.close();
+    }
     const previous = peer;
     peer = null;
     previous?.close();
@@ -28,10 +50,15 @@ export function connectPhoneCamera({ role, room, stream = null, onStatus, onStre
     // Only the phone requests retries, avoiding competing negotiations.
     if (role === 'sender') retryTimer = setTimeout(() => send({ type: 'retry' }), 1500);
   };
-  const createPeer = () => {
+  const createPeer = (relay) => {
     resetPeer();
+    dashboardRelay = relay;
     const current = new RTCPeerConnection({ iceServers: [] }); // Same LAN; no external signaling or relay.
     peer = current;
+    if (!dashboardRelay) {
+      if (role === 'sender') bindChannel(current.createDataChannel('evaluation', { ordered: true }));
+      else current.ondatachannel = ({ channel: incoming }) => { if (peer === current) bindChannel(incoming); };
+    }
     onError('');
     onStatus('connecting');
     current.onicecandidate = ({ candidate }) => {
@@ -64,7 +91,8 @@ export function connectPhoneCamera({ role, room, stream = null, onStatus, onStre
     if (message.type === 'peer-left') { session = null; resetPeer(); onError(''); onStatus('waiting'); return; }
     if (message.type === 'ready') {
       session = message.session;
-      const current = createPeer();
+      const current = createPeer(message.dashboardRelay === true);
+      if (dashboardRelay) onDataStatus(true);
       if (role === 'sender') {
         await current.setLocalDescription(await current.createOffer());
         if (peer === current) send({ type: 'offer', description: current.localDescription.toJSON() });
@@ -73,7 +101,9 @@ export function connectPhoneCamera({ role, room, stream = null, onStatus, onStre
     }
     const current = peer;
     if (!current || message.session !== session) return;
-    if (message.type === 'ice') {
+    if (message.type === 'evaluation') {
+      if (dashboardRelay) onData(message.data);
+    } else if (message.type === 'ice') {
       if (current.remoteDescription) await current.addIceCandidate(message.candidate);
       else candidates.push(message.candidate);
     } else if (message.type === 'offer' || message.type === 'answer') {
@@ -98,7 +128,7 @@ export function connectPhoneCamera({ role, room, stream = null, onStatus, onStre
     currentSocket.onopen = () => {
       backoff = 1000;
       onError('');
-      send({ type: 'join', role, room });
+      send({ type: 'join', role, room, dashboardRelay: true });
     };
     currentSocket.onmessage = ({ data }) => {
       messages = messages.then(() => {
@@ -122,7 +152,7 @@ export function connectPhoneCamera({ role, room, stream = null, onStatus, onStre
     };
   };
   connect();
-  return () => {
+  const close = () => {
     stopped = true;
     clearTimeout(reconnectTimer);
     resetPeer();
@@ -131,4 +161,13 @@ export function connectPhoneCamera({ role, room, stream = null, onStatus, onStre
       socket.close();
     }
   };
+  close.sendData = (message) => {
+    const transport = dashboardRelay ? socket : channel;
+    const openState = dashboardRelay ? WebSocket.OPEN : 'open';
+    if (stopped || !session || transport?.readyState !== openState || transport.bufferedAmount > DASHBOARD_MAX_BYTES) return false;
+    const data = JSON.stringify(dashboardRelay ? { type: 'evaluation', session, data: message } : message);
+    if (new TextEncoder().encode(data).length > DASHBOARD_MAX_BYTES) return false;
+    try { transport.send(data); return true; } catch { return false; }
+  };
+  return close;
 }

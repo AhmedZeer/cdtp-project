@@ -39,7 +39,7 @@ export function LiveStatusBar({ motion, telemetry, linkSilenceS, run }) {
 }
 
 /** Task selection, Start/End Test, live progress, sealed results and the run history (C5 tally). */
-export default function EvaluationPanel({ ready, notReadyReason, run, runTask, onStart, onEnd, results }) {
+export default function EvaluationPanel({ ready, notReadyReason, run, runTask, onStart, onEnd, results, live = false }) {
   const [taskId, setTaskId] = useState('static-balance');
   const [direction, setDirection] = useState('forward');
   const [openIndex, setOpenIndex] = useState(0);
@@ -74,7 +74,8 @@ export default function EvaluationPanel({ ready, notReadyReason, run, runTask, o
           </select>
         </label>}
         <p className="mb-2 text-slate-400">{task.summary}</p>
-        {TASK_HINTS[taskId] && <p className="mb-2 text-cyan-200">{TASK_HINTS[taskId]}</p>}
+        {!live && TASK_HINTS[taskId] && <p className="mb-2 text-cyan-200">{TASK_HINTS[taskId]}</p>}
+        {live && <p className="mb-2 text-cyan-200">Use the real robot and glove. Camera measurements come from the phone; tilt and charging require external telemetry. Keep the phone fixed and all three role markers visible. Unreported glove commands are marked as unverified in the record.</p>}
         <button disabled={!ready} className="w-full rounded-lg bg-emerald-500 px-3 py-2 font-bold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
           onClick={(e) => { onStart({ id: taskId, ...(taskId === 'robot-guidance' ? { direction } : {}) }); setOpenIndex(0); e.currentTarget.blur(); }}>
           ▶ Start Test
@@ -134,7 +135,7 @@ function ResultCard({ sealed }) {
   return (
     <div className={`mt-3 rounded-lg border p-3 ${STATUS_STYLE[result.status]}`}>
       <p className="text-sm font-bold">{result.status.toUpperCase()} · {result.points}/5 points</p>
-      <p className="mb-2 text-slate-300">{task.name}{record.task.direction ? ` (${record.task.direction})` : ''} · {fmt(record.durationS)} s · ended {record.endReason === 'completed' ? 'automatically' : record.endReason === 'time-limit' ? 'at the time limit' : 'by the user'} · {record.frames.length} frames, {record.packets.length} packets</p>
+      <p className="mb-2 text-slate-300">{record.meta?.source === 'phone' ? 'Phone camera · ' : ''}{task.name}{record.task.direction ? ` (${record.task.direction})` : ''} · {fmt(record.durationS)} s · ended {record.endReason === 'completed' ? 'automatically' : record.endReason === 'time-limit' ? 'at the time limit' : record.endReason === 'user' ? 'by the user' : record.endReason.replaceAll('-', ' ')} · {record.frames.length} frames, {record.packets.length} packets</p>
       <ul className="space-y-1">
         {result.checks.map((c) => {
           const [icon, tone] = CHECK_ICON[c.status];

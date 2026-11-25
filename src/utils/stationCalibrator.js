@@ -19,6 +19,7 @@ export function createStationCalibrator(station) {
   const calibrator = {
     get status() { return status; },
     reset() { samples = []; status = { state: 'waiting', progress: 0 }; return status; },
+    configure(nextStation) { station = { ...nextStation }; return calibrator.reset(); },
     /** Feed one frame's detections; returns the (possibly unchanged) status. */
     push(markers, { getIntrinsics, getUp, estimateFocal }) {
       const seen = markers.find((m) => m.id === station.id);

@@ -8,7 +8,8 @@ const LINK_STATUS = { signaling: 'Connecting…', waiting: 'Waiting for phone', 
   connected: 'Connected', reconnecting: 'Reconnecting…', error: 'Connection error' };
 
 /** Receives phone video, falling back to simulator frames when no camera client is connected. */
-export default function PhoneCameraDebug({ sourceRef, sourceError }) {
+export default function PhoneCameraDebug({ sourceRef, sourceError, onStreamChange, dashboard, onControl }) {
+  const connectionRef = useRef(null), dashboardRef = useRef(null), controlRef = useRef(null);
   const canvasRef = useRef(null), videoRef = useRef(null), countRef = useRef(0);
   const [room] = useState(() => readCameraRoom() ?? crypto.randomUUID().replaceAll('-', ''));
   const [phoneOrigin, setPhoneOrigin] = useState(window.location.origin);
@@ -32,10 +33,22 @@ export default function PhoneCameraDebug({ sourceRef, sourceError }) {
     return () => controller.abort();
   }, [room]);
 
+  useEffect(() => { dashboardRef.current = dashboard; connectionRef.current?.sendData(dashboard); }, [dashboard]);
+  useEffect(() => { controlRef.current = onControl; }, [onControl]);
   useEffect(() => {
     if (!window.RTCPeerConnection) return undefined;
-    return connectPhoneCamera({ role: 'receiver', room, onStatus: setLinkStatus, onStream: setStream, onError: setLinkError });
-  }, [room]);
+    const connection = connectPhoneCamera({ role: 'receiver', room, onStatus: setLinkStatus,
+      onStream: (next) => { setStream(next); onStreamChange?.(next); }, onError: setLinkError,
+      onDataStatus: (open) => { if (open && dashboardRef.current) connectionRef.current?.sendData(dashboardRef.current); },
+      onData: (message) => {
+        if (message?.type !== 'control') return;
+        const result = controlRef.current?.(message) ?? { ok: false, error: 'Evaluation is not ready.' };
+        connectionRef.current?.sendData({ type: 'control-result', id: message.id, ...result });
+      },
+    });
+    connectionRef.current = connection;
+    return () => { connectionRef.current = null; connection(); };
+  }, [room, onStreamChange]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -98,7 +111,7 @@ export default function PhoneCameraDebug({ sourceRef, sourceError }) {
           {live ? 'Phone connected' : 'Mock fallback'}
         </span>
       </div>
-      <p className="mb-3 text-slate-400">Connect a phone to see its camera here. Without a connected camera, the preview uses simulator frames.</p>
+      <p className="mb-3 text-slate-400">Connecting a phone replaces the main view and supplies marker detection, calibration and tests. Without a phone, the simulator is active.</p>
       <div className="flex flex-col gap-3 sm:flex-row">
         <div className="relative w-full overflow-hidden rounded border border-slate-800 bg-black sm:max-w-sm" style={{ aspectRatio: '16 / 9' }}>
           <canvas ref={canvasRef} width={PREVIEW_WIDTH} height={PREVIEW_HEIGHT} className="h-full w-full" aria-label="Phone camera preview with simulator fallback" />
@@ -130,7 +143,7 @@ export default function PhoneCameraDebug({ sourceRef, sourceError }) {
           <button type="button" onClick={copyLink} className="min-h-11 rounded bg-slate-700 px-3 font-semibold hover:bg-slate-600">Copy phone link</button>
         </div>
         {copyStatus && <p className="mt-2 text-slate-400" role="status">{copyStatus}</p>}
-        <p className="mt-2 text-slate-500">Use the same Wi-Fi and accept or trust the laptop’s HTTPS certificate on the phone. Preview only; scored evaluation still uses the simulator.</p>
+        <p className="mt-2 text-slate-500">Use the same Wi-Fi and accept or trust the laptop’s HTTPS certificate on the phone. Keep the phone fixed while calibrating and testing. Pausing this small preview does not pause detection.</p>
       </div>
       {(!window.RTCPeerConnection || linkError) && <p role="alert" className="mt-2 text-amber-300">{linkError || 'This browser does not support phone video streaming.'} The mock fallback remains available.</p>}
     </section>

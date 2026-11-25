@@ -1,13 +1,22 @@
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 
-/** A room holds one phone and one laptop. Video travels over WebRTC, not this socket. */
+const DASHBOARD_LIMIT = 128 * 1024;
+
+/** The room exchanges signaling and analysis messages. Video travels over WebRTC. */
 export function attachCameraSignaling(httpServer) {
   let closed = false;
   const rooms = new Map();
   const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
   const send = (client, message) => {
     if (client?.readyState === WebSocket.OPEN) client.send(JSON.stringify(message));
+  };
+  const ready = (room) => {
+    room.session = randomUUID();
+    room.dashboardRelay = Boolean(room.sender?.dashboardRelay && room.receiver?.dashboardRelay);
+    for (const peer of [room.sender, room.receiver]) {
+      send(peer, { type: 'ready', session: room.session, dashboardRelay: room.dashboardRelay });
+    }
   };
   const upgrade = (request, socket, head) => {
     if (request.url?.split('?')[0] !== '/camera-signal') return;
@@ -42,24 +51,29 @@ export function attachCameraSignaling(httpServer) {
         if (room[role]) { room = null; client.close(1008, `A ${role} is already connected to this camera room.`); return; }
         clearTimeout(joinedWithin);
         rooms.set(roomId, room);
+        client.dashboardRelay = message.dashboardRelay === true;
         room[role] = client;
         send(client, { type: 'joined' });
-        if (room.sender && room.receiver) {
-          room.session = randomUUID();
-          for (const peer of [room.sender, room.receiver]) send(peer, { type: 'ready', session: room.session });
-        }
+        if (room.sender && room.receiver) ready(room);
         return;
       }
       if (!room.session || message.session !== room.session) return;
       if (message.type === 'retry') {
-        room.session = randomUUID();
-        for (const peer of [room.sender, room.receiver]) send(peer, { type: 'ready', session: room.session });
+        ready(room);
+        return;
+      }
+      const other = room[role === 'sender' ? 'receiver' : 'sender'];
+      if (message.type === 'evaluation') {
+        if (!room.dashboardRelay || raw.length > DASHBOARD_LIMIT || !other) return;
+        const type = message.data?.type;
+        const allowed = role === 'sender' ? type === 'control' : ['dashboard', 'control-result'].includes(type);
+        if (allowed && (type !== 'dashboard' || other.bufferedAmount <= DASHBOARD_LIMIT)) send(other, message);
         return;
       }
       if (!['offer', 'answer', 'ice'].includes(message.type)) return;
       if (message.type === 'offer' && role !== 'sender') return;
       if (message.type === 'answer' && role !== 'receiver') return;
-      send(room[role === 'sender' ? 'receiver' : 'sender'], {
+      send(other, {
         type: message.type, session: room.session,
         ...(message.type === 'ice' ? { candidate: message.candidate } : { description: message.description }),
       });

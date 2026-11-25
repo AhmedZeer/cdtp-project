@@ -14,7 +14,7 @@ async function fixture(t) {
   await once(server, 'listening');
   const origin = `http://127.0.0.1:${server.address().port}`;
   t.after(async () => { close(); server.close(); await once(server, 'close'); });
-  const connect = async (role, room = ROOM) => {
+  const connect = async (role, room = ROOM, dashboardRelay = false) => {
     const socket = new WebSocket(`${origin.replace('http:', 'ws:')}/camera-signal`, { origin });
     const queue = [], waiting = [];
     socket.on('message', (data) => {
@@ -33,7 +33,7 @@ async function fixture(t) {
     };
     await once(socket, 'open');
     const send = (message) => socket.send(JSON.stringify(message));
-    send({ type: 'join', role, room });
+    send({ type: 'join', role, room, dashboardRelay });
     return { socket, send, next, queue };
   };
   return { origin, connect };
@@ -93,4 +93,25 @@ test('invalid pairing rooms and cross-origin socket connections are refused', as
   const [, response] = await once(socket, 'unexpected-response');
   assert.equal(response.statusCode, 403);
   socket.terminate();
+});
+
+test('the pairing socket relays current dashboard data and controls only to the matching peer', async (t) => {
+  const { connect } = await fixture(t);
+  const laptop = await connect('receiver', ROOM, true);
+  const unrelated = await connect('sender', 'b'.repeat(32), true);
+  const phone = await connect('sender', ROOM, true);
+  const { session, dashboardRelay } = await laptop.next('ready');
+  assert.equal(dashboardRelay, true);
+  assert.equal((await phone.next('ready')).dashboardRelay, true);
+
+  const snapshot = { type: 'dashboard', markers: [{ id: 100 }] };
+  phone.send({ type: 'evaluation', session, data: snapshot });
+  laptop.send({ type: 'evaluation', session: 'stale', data: { ...snapshot, markers: [] } });
+  laptop.send({ type: 'evaluation', session, data: snapshot });
+  assert.deepEqual((await phone.next('evaluation')).data, snapshot);
+
+  const command = { type: 'control', id: '1', action: 'recalibrate' };
+  phone.send({ type: 'evaluation', session, data: command });
+  assert.deepEqual((await laptop.next('evaluation')).data, command);
+  assert.equal(unrelated.queue.some(({ type }) => type === 'evaluation'), false);
 });

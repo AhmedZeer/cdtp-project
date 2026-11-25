@@ -87,39 +87,96 @@ to misread small or oblique markers, and refining first fixes that. Each cell is
 read from its central 4×4 of the 8×8 warped pixels, away from blurred cell edges. It is
 the detector option `refine: true`; the live camera page does not use it yet.
 
-### Phone camera streaming and mock fallback
+### Phone camera streaming, detection and evaluation
 
 1. Run `npm run dev` on the laptop and open `https://localhost:5173/?scene=sim3d`.
-2. Below the drive controls, find **Phone camera preview** and **Copy phone link**.
-   The link uses the laptop's LAN address, with a pairing room unique to this preview.
-3. Open that link on a phone on the same Wi-Fi. Accept or trust the laptop's local
-   HTTPS certificate, tap **Start camera**, and allow camera access.
-4. The phone's rear-camera video streams to the laptop over WebRTC. The preview
-   automatically switches to **Live phone video**. **Stop camera** on the phone or
-   close its page to return to **Mock · simulator frames**. Connecting again switches
-   back to phone video. The phone can also start first and wait for the laptop.
+2. Under **Phone camera preview**, use **Copy phone link**. It contains the laptop’s
+   LAN address and a pairing room unique to this page.
+3. Open that link on a phone on the same Wi-Fi. Accept or trust the laptop’s local
+   HTTPS certificate, tap **Start camera**, and allow camera access. Keep the page visible.
+4. The live phone video **replaces the main simulator view**. The simulator pauses.
+   The detector processes the received video at up to 10 Hz, with sub-pixel corner
+   refinement. Outlines, role labels, marker IDs and local +X/+Y axes appear over
+   the actual video. The detection table and motion bar use the phone observations.
+5. In **Phone camera setup**, match the dictionary printed on your markers:
+   OpenCV DICT_5X5_100 (default), DICT_6X6_250 or **Original ArUco** (the legacy js-aruco decoder). Assign distinct
+   station, robot and medicine-box IDs. Detected IDs and visible roles are listed.
+6. Enter the station marker’s **black-square size**, each marker’s height above
+   the floor/reference plane and forward offset, plus station and robot body depths.
+   Defaults match the simulator; replace them with measurements of your real setup.
+   Markers must lie on horizontal planes. Station +X points out of the docking face;
+   robot +X points forward. Medicine offset is measured from the robot axle.
+7. Hold the phone fixed with the station visible. Calibration averages 10 detections,
+   solves the camera pose and freezes it. **Estimate focal length** derives focal
+   length from an oblique station view. For a face-on/overhead view, disable it and
+   enter the calibrated focal length in the actual source-video pixels. Phone tilt
+   is solved from the marker; no simulated intrinsics or accelerometer data are used.
+8. Once calibrated and the robot is tracked, use **Start Test** for the same static
+   balance, guidance, charging, charging-indicator and integrated tasks. Motion,
+   distance, docking geometry and medicine retention use calibrated phone detections.
+   Reports, sealed JSON downloads and verification work for physical runs too.
 
-The preview preserves the video's aspect ratio within 640×360 and copies up to 10
-frames per second. Diagnostics show connection status, actual source resolution,
-preview rate and frame count. **Pause preview** holds the displayed frame while the
-connection and simulator keep running; **Resume preview** refreshes it again.
+The phone page is also an evaluation dashboard. It shows the same role-coloured
+marker outlines, IDs and +X/+Y coordinate frames over its own camera preview,
+plus source resolution, camera frame count/FPS, detection time, motion, telemetry,
+calibration progress, camera/robot measurements and the latest test result checks.
+**Show marker frames** toggles the overlay without affecting detection.
 
-Signaling runs in Vite at `/camera-signal`, separate from robot telemetry at `/ws`.
-No extra server process or dependency is needed. Both `npm run dev` and `npm run preview -- --host 0.0.0.0`
-provide signaling. This is a same-network connection: it does not configure a TURN
-relay for networks that block direct device-to-device traffic. Static hosting alone
-does not provide the signaling endpoint. Keep the phone page visible while streaming.
+Use the phone’s **Marker dictionary** selector to change dictionaries on both
+screens. For the arucogen **Original ArUco** marker in the example, select
+**Original ArUco**, then open **Marker roles and physical setup** and assign
+robot ID **100** if that is the robot marker. This family supports IDs 0–1023.
+OpenCV 5×5 IDs are limited to 0–99; OpenCV 6×6 IDs are limited to 0–249.
 
-**Evaluation still uses the simulator's observations and telemetry.** Phone video is
-available for preview/debugging; the remaining measurement integration is:
+The phone can apply marker settings, **Recalibrate**, and **Start Test / End Test**.
+Changes are acknowledged by the laptop; settings lock during tests. Marker setup
+uses revision checks so an outdated phone edit cannot overwrite a newer laptop
+edit. Full sealed records and run history remain on the laptop. Live phone controls and measurements use the existing pairing WebSocket.
+Camera video travels over WebRTC.
+The laptop remains the detector and evaluator. Keep both pages open. When analysis
+is disconnected or more than two seconds old, the phone hides its marker overlays
+and disables remote controls until fresh laptop measurements return.
 
-- Feed received video frames into the simulator's refined `DICT_5X5_100` worker
-  (station 0, robot 1, medicine box 2). The older live page at `/` uses a different detector.
-- Replace simulated focal length, gravity and marker dimensions with phone calibration,
-  phone sensor readings and measurements of the real marker mounts. Reset calibration
-  when the camera, video orientation or resolution changes.
-- Connect real telemetry and available glove-command evidence to the shared recorder
-  using a common clock, then validate metric accuracy and dropout handling on hardware.
+Physical runs use wall-clock timestamps and external telemetry through `/ws`
+(or `VITE_WS_URL`). The simulator’s controls, docking controller, truth map and
+telemetry are disabled while the phone is active. Drive the physical robot with
+its real controller/glove. Basic telemetry packets must include finite numeric
+`tilt` (degrees), `battery` (volts) and boolean `charging`:
+
+```json
+{ "tilt": 0.2, "battery": 12.4, "charging": false }
+```
+
+For command/autonomy evidence, the robot bridge can additionally report
+`commandsAvailable: true` in its telemetry before the test starts, `command`
+(`forward`, `backward`, `left`, `right`, `stop`) on command events, `ignored: true`
+for commands it did not execute, and `operatorActive` (boolean) with each telemetry
+packet. The latter must include latched drive and active turns, even if a command
+started before the test. Optional `mode` supplies the robot-mode readout. Missing
+telemetry, medicine tracking or required command/autonomy evidence is reported as
+failed or inconclusive; the app never substitutes simulator evidence. A mock
+telemetry service is still available for development, but is not hardware evidence.
+
+Stopping/disconnecting the phone resumes the simulator. Source changes, resolution
+changes (including rotation), configuration changes, or movement of the calibrated
+station/camera end an active test and require fresh calibration. Interrupted runs
+cannot pass. Settings lock during tests. Reconnecting a phone recalibrates from
+scratch. A stalled video clears stale detections instead of repeatedly recording
+its last frame as fresh tracking.
+
+The main view and overlays use actual video dimensions, including portrait video.
+The smaller debug preview preserves aspect ratio within 640×360. **Pause preview**
+only freezes that smaller preview; main-view detection and evaluation keep running.
+Signaling runs in Vite at `/camera-signal`, separate from robot telemetry `/ws`.
+No additional signaling process or dependency is needed. Both `npm run dev` and
+`npm run preview -- --host 0.0.0.0` provide signaling. Static hosting alone does not.
+Both devices must be on a network allowing direct device-to-device WebRTC traffic;
+no TURN relay is configured.
+
+A single-marker calibration assumes a pinhole camera with square pixels and its
+principal point at image centre. Validate real metric accuracy with known distances;
+lens distortion, marker mounting and corner noise affect measurements. Printed
+robot and medicine markers must be large enough to decode clearly at room distance.
 
 ### Controls
 

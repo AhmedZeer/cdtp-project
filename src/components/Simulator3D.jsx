@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createSimScene, CAMERA_PRESETS, RENDER_WIDTH, RENDER_HEIGHT } from '../sim/scene3d';
 import { telemetryPacket, dockGeometry, toStationFrame, inApproachRegion, APPROACH_RADIUS, wrapAngle } from '../sim/world';
 import { presetIntrinsics, upInCamera } from '../sim/cameraRig';
@@ -9,16 +9,20 @@ import { createStationCalibrator } from '../utils/stationCalibrator';
 import { metricScene } from '../utils/metricScene';
 import { centre } from '../utils/playgroundGeometry';
 import { markerFrame } from '../utils/markerFrame';
-import MarkerAxes from './MarkerAxes';
+import DetectionOverlay from './DetectionOverlay';
+import { useImagePixelsPerScreenPixel } from '../hooks/useImageScale';
+import { ROLE_COLOURS, ROLE_LABELS } from '../utils/markerRoles';
 import PhoneCameraDebug from './PhoneCameraDebug';
 import EvaluationPanel, { LiveStatusBar } from './EvaluationPanel';
 import { createRunRecorder } from '../eval/runRecorder';
 import { createMotionEstimator } from '../eval/motionState';
 import { sealRun } from '../eval/seal';
+import { WS_URL } from '../config';
+import { defaultPhoneSetup, phoneSetupError, phoneIntrinsics, phoneGeometry, readPhysicalPacket } from '../utils/phoneVision';
+import PhoneVisionSetup from './PhoneVisionSetup';
+import { readPhoneControl, summarizePhoneResult } from '../utils/phoneDashboard';
 
 const ROLE_BY_ID = Object.fromEntries(Object.entries(MARKERS).map(([role, m]) => [m.id, role]));
-const ROLE_COLOURS = { robot: '#10b981', medicine: '#f43f5e', station: '#38bdf8' };
-const ROLE_LABELS = { robot: 'Robot', medicine: 'Medicine box', station: 'Station' };
 const deg = (rad) => (rad * 180) / Math.PI;
 const GEOMETRY = {
   ids: { robot: MARKERS.robot.id, medicine: MARKERS.medicine.id }, mounts: MARKER_MOUNTS,
@@ -54,17 +58,35 @@ function snapshot(controller) {
 }
 
 /** Image-plane measurement from one detected marker (pixels, image +y down). */
-function measure(marker) {
+function measure(marker, roles = ROLE_BY_ID) {
   const c = centre(marker.corners);
   const frame = markerFrame(marker.corners);
   const heading = frame ? deg(Math.atan2(-(frame.x.y - frame.origin.y), frame.x.x - frame.origin.x)) : null;
-  return { id: marker.id, role: ROLE_BY_ID[marker.id], corners: marker.corners, centre: c, heading };
+  return { id: marker.id, role: roles[marker.id], corners: marker.corners, centre: c, heading };
 }
 
 export default function Simulator3D() {
   const canvasRef = useRef(null);
-  const viewRef = useRef(null);
-  const unit = useImagePixelsPerScreenPixel(viewRef);
+  const viewRef = useRef(null), phoneVideoRef = useRef(null), phoneStreamRef = useRef(null);
+  const [phoneActive, setPhoneActive] = useState(false);
+  const [frameSize, setFrameSize] = useState({ width: RENDER_WIDTH, height: RENDER_HEIGHT });
+  const unit = useImagePixelsPerScreenPixel(viewRef, frameSize.width);
+  const [phoneSetup, setPhoneSetupState] = useState(defaultPhoneSetup);
+  const phoneSetupRef = useRef(phoneSetup), setupRevisionRef = useRef(0), resetPendingRef = useRef(false);
+  const setPhoneSetup = (next) => {
+    phoneSetupRef.current = next;
+    setupRevisionRef.current += 1;
+    setPhoneSetupState(next);
+    resetPendingRef.current = true;
+  };
+  const onPhoneStream = useCallback((stream) => {
+    phoneStreamRef.current = stream;
+    const video = phoneVideoRef.current;
+    if (video) {
+      video.srcObject = stream;
+      if (stream) video.play().catch(() => {});
+    }
+  }, []);
   const [controller] = useState(createSimController);
   useEffect(() => { if (import.meta.env.DEV) window.__sim = controller; }, [controller]); // dev-only hook for scripted checks
   const sceneRef = useRef(null);
@@ -75,6 +97,7 @@ export default function Simulator3D() {
   const [vision, setVision] = useState({ markers: [], ms: 0, at: 0, metric: null, motion: { state: 'not-tracked', direction: null } });
   const [telemetry, setTelemetry] = useState(null);
   const [error, setError] = useState('');
+  const [detectorError, setDetectorError] = useState('');
   const [calibrator] = useState(() => createStationCalibrator({ id: MARKERS.station.id, size: MARKERS.station.size, height: MARKER_MOUNTS.station.height }));
   const [calibration, setCalibration] = useState(calibrator.status);
   const [calSettings, setCalSettingsState] = useState({ useGravity: true, estimateFocal: false });
@@ -82,10 +105,9 @@ export default function Simulator3D() {
   const setCalSettings = (patch) => {
     calSettingsRef.current = { ...calSettingsRef.current, ...patch };
     setCalSettingsState((prev) => ({ ...prev, ...patch }));
-    staleBeforeRef.current = postedSeqRef.current;
-    setCalibration(calibrator.reset());
+    resetPendingRef.current = true;
   };
-  const recalibrate = () => { staleBeforeRef.current = postedSeqRef.current; setCalibration(calibrator.reset()); };
+  const recalibrate = () => { resetPendingRef.current = true; };
   // Detections already in flight when the view or settings change must not feed the new calibration.
   const postedSeqRef = useRef(0), staleBeforeRef = useRef(0);
 
@@ -98,14 +120,16 @@ export default function Simulator3D() {
   const [dropout, setDropoutState] = useState(false);
   const dropoutRef = useRef(false);
   const setDropout = (on) => { dropoutRef.current = on; setDropoutState(on); };
-  useEffect(() => controller.subscribe((name, meta) => runRef.current?.addCommand(controller.world.time, name, meta?.ignored)), [controller]);
+  useEffect(() => controller.subscribe((name, meta) => { if (!phoneStreamRef.current) runRef.current?.addCommand(controller.world.time, name, meta?.ignored); }), [controller]);
   const [autoDock, setAutoDockState] = useState(controller.autoDock);
   const setAutoDock = (on) => { controller.setAutoDock(on); setAutoDockState(on); };
   const startRun = (task) => {
     const cal = calibrator.status.cal;
+    if (runRef.current || calibrator.status.state !== 'ready' || resetPendingRef.current || Boolean(phoneStreamRef.current) !== phoneActive || (phoneActive && (!vision.metric?.robot || phoneSetupError(phoneSetup)))) return;
     runRef.current = createRunRecorder({
-      task, startT: controller.world.time, commandsAvailable: true,
-      meta: { source: 'simulator', camera: preset, commandMode: mode,
+      task, startT: phoneActive ? performance.now() / 1000 : controller.world.time, commandsAvailable: !phoneActive || latestPacketRef.current?.commandsAvailable === true,
+      meta: { source: phoneActive ? 'phone' : 'simulator', camera: phoneActive ? 'rear camera' : preset, commandMode: phoneActive ? 'external' : mode,
+        ...(phoneActive ? { setup: structuredClone(phoneSetup), resolution: frameSize, telemetrySource: WS_URL } : {}),
         calibration: { cameraHeightM: cal.cameraHeight, reprojectionPx: cal.reprojectionPx, focalPx: cal.K.fx, tiltFromImu: calibrator.status.usedGravity } },
     });
     setRunTask(task);
@@ -118,11 +142,11 @@ export default function Simulator3D() {
     const isFormField = (el) => ['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(el?.tagName);
     const down = (e) => {
       const name = KEYMAP[e.code];
-      if (!name || isFormField(e.target)) return;
+      if (!name || phoneStreamRef.current || isFormField(e.target)) return;
       e.preventDefault();
       if (!e.repeat) controller.command(name, true);
     };
-    const up = (e) => { const name = KEYMAP[e.code]; if (name) controller.command(name, false); };
+    const up = (e) => { const name = KEYMAP[e.code]; if (name && !phoneStreamRef.current) controller.command(name, false); };
     const blur = () => controller.releaseAll();
     window.addEventListener('keydown', down);
     window.addEventListener('keyup', up);
@@ -131,111 +155,213 @@ export default function Simulator3D() {
   }, [controller]);
 
   useEffect(() => {
-    let sim;
+    let sim = null;
     try { sim = createSimScene(canvasRef.current); } catch (err) {
       queueMicrotask(() => setError(`WebGL unavailable: ${err.message}`));
-      return undefined;
     }
     sceneRef.current = sim;
-    sim.setCameraPreset(preset);
+    sim?.setCameraPreset(preset);
     const worker = new Worker(new URL('../sim/detector.worker.js', import.meta.url), { type: 'module' });
-    let inFlight = false, seq = 0, operatorAtGrab = false;
-    const motionEstimator = createMotionEstimator();
+    let inFlight = false, seq = postedSeqRef.current, operatorAtGrab;
+    let motionEstimator = createMotionEstimator();
+    let activeStream = null, width = RENDER_WIDTH, height = RENDER_HEIGHT;
+    let lastVideoTime = -1, lastPhoneFrameAt = -Infinity, lastDetectedAt = -Infinity;
+    let socket = null, reconnectTimer, disposed = false;
+    const connectTelemetry = () => {
+      if (disposed || !activeStream) return;
+      const current = new WebSocket(WS_URL);
+      socket = current;
+      current.onmessage = ({ data }) => {
+        if (socket !== current || !activeStream) return;
+        let packet;
+        try { packet = readPhysicalPacket(JSON.parse(data)); } catch { return; }
+        if (!packet) return;
+        const t = performance.now() / 1000;
+        latestPacketRef.current = { ...packet, simTime: t };
+        setTelemetry(latestPacketRef.current);
+        runRef.current?.addPacket(t, packet);
+        if (packet.command) runRef.current?.addCommand(t, packet.command, packet.ignored);
+      };
+      current.onclose = () => {
+        if (!disposed && socket === current && activeStream) reconnectTimer = setTimeout(connectTelemetry, 1000);
+      };
+      current.onerror = () => current.close();
+    };
+    const closeTelemetry = () => {
+      clearTimeout(reconnectTimer);
+      const old = socket;
+      socket = null;
+      old?.close();
+    };
     worker.onmessage = ({ data }) => {
       inFlight = false;
-      let status = calibrator.status;
-      if (data.seq > staleBeforeRef.current) {
-        const settings = calSettingsRef.current;
-        status = calibrator.push(data.markers, {
-          getIntrinsics: () => presetIntrinsics(settings.preset), // stands in for the phone's factory calibration
-          getUp: () => (settings.useGravity ? noisyUp(sim.camera) : null),
-          estimateFocal: settings.estimateFocal,
-        });
-        setCalibration(status);
-      }
-      const metric = status.state === 'ready' ? metricScene(status.cal, data.markers, GEOMETRY) : null;
+      // A result belongs to the exact source, dimensions and settings at capture time.
+      if (data.seq <= staleBeforeRef.current || resetPendingRef.current || phoneStreamRef.current !== activeStream) return;
+      const settings = calSettingsRef.current, setup = phoneSetupRef.current;
+      if (activeStream && phoneSetupError(setup)) return;
+      const status = calibrator.push(data.markers, {
+        getIntrinsics: () => activeStream ? phoneIntrinsics(width, height, setup.focalPx) : presetIntrinsics(settings.preset),
+        getUp: () => (!activeStream && settings.useGravity && sim ? noisyUp(sim.camera) : null),
+        estimateFocal: activeStream ? setup.estimateFocal : settings.estimateFocal,
+      });
+      setCalibration(status);
+      if (status.state === 'moved') endRunRef.current('camera-moved');
+      const geometry = activeStream ? phoneGeometry(setup) : GEOMETRY;
+      const metric = status.state === 'ready' ? metricScene(status.cal, data.markers, geometry) : null;
       const motion = motionEstimator.observe(data.simTime, metric?.robot ?? null, latestPacketRef.current?.tilt ?? null);
       runRef.current?.addFrame(data.simTime, metric?.robot ?? null, metric?.medicine ?? null, operatorAtGrab);
-      setVision({ markers: data.markers.map(measure), ms: data.ms, at: data.simTime, metric, motion });
+      const roles = activeStream ? Object.fromEntries(Object.entries(setup.ids).map(([role, id]) => [id, role])) : ROLE_BY_ID;
+      setVision({ markers: data.markers.map((m) => measure(m, roles)), ms: data.ms, at: data.simTime, metric, motion, fresh: true });
+      lastDetectedAt = performance.now();
     };
     endRunRef.current = (reason) => {
       const run = runRef.current;
       if (!run) return;
       runRef.current = null;
-      const record = run.finish(controller.world.time, reason);
+      const record = run.finish(activeStream ? performance.now() / 1000 : controller.world.time, reason);
       setRunTask(null);
       sealRun(record).then((sealed) => setResults((prev) => [sealed, ...prev]));
     };
-    worker.onerror = (e) => { inFlight = false; setError(`Detector failed: ${e.message}`); };
+    worker.onerror = (e) => { inFlight = false; setDetectorError(`Marker detector failed: ${e.message}. Reload the page to restart it.`); };
     const grab = document.createElement('canvas');
-    grab.width = RENDER_WIDTH; grab.height = RENDER_HEIGHT;
     const grabCtx = grab.getContext('2d', { willReadFrequently: true });
     const stepSeconds = 1 / PHYSICS_HZ;
     let frame, last = performance.now(), carry = 0, lastDetect = -Infinity, lastHud = -Infinity, nextTelemetry = 0;
-    let rate = { wall: performance.now(), sim: controller.world.time, value: 1 }; // simulated seconds per real second
+    let rate = { wall: performance.now(), sim: controller.world.time, value: 1 };
 
     function loop(now) {
-      const world = controller.world;
-      const elapsed = Math.min(0.25, (now - last) / 1000); // clamp after tab switches / long stalls
-      last = now;
-      carry = controller.advance(elapsed + carry, stepSeconds); // physics + onboard IR/docking controller
-      sim.sync(world);
-      sim.render();
-
-      // The detector sees only rendered pixels; overlays are drawn in SVG on top.
-      // Detection runs in a worker; at most one frame is in flight, so a slow device detects less often.
-      if (!inFlight && now - lastDetect >= 1000 / DETECTION_HZ) {
-        lastDetect = now;
-        inFlight = true;
-        grabCtx.drawImage(sim.renderer.domElement, 0, 0);
-        const image = grabCtx.getImageData(0, 0, RENDER_WIDTH, RENDER_HEIGHT);
-        postedSeqRef.current = ++seq;
-        operatorAtGrab = controller.operatorActive(); // only one frame is ever in flight
-        worker.postMessage({ image, family: MARKER_FAMILY, minPerimeterFraction: 0.03, simTime: world.time, seq }, [image.data.buffer]);
+      const world = controller.world, stream = phoneStreamRef.current, video = phoneVideoRef.current;
+      const sourceChanged = activeStream !== stream;
+      const nextWidth = stream ? video.videoWidth || width : RENDER_WIDTH;
+      const nextHeight = stream ? video.videoHeight || height : RENDER_HEIGHT;
+      const resized = nextWidth !== width || nextHeight !== height;
+      if (sourceChanged || resized || resetPendingRef.current) {
+        // Seal the old run before switching clocks. A run never mixes physical and simulated evidence.
+        endRunRef.current(sourceChanged ? 'camera-source-changed' : resized ? 'camera-resolution-changed' : 'configuration-changed');
+        if (sourceChanged) {
+          closeTelemetry();
+          activeStream = stream;
+          controller.releaseAll();
+          latestPacketRef.current = null;
+          setTelemetry(null);
+          setPhoneActive(Boolean(stream));
+          if (stream) connectTelemetry();
+        }
+        width = nextWidth; height = nextHeight;
+        setFrameSize({ width, height });
+        lastVideoTime = -1; lastPhoneFrameAt = -Infinity;
+        staleBeforeRef.current = postedSeqRef.current;
+        resetPendingRef.current = false;
+        motionEstimator = createMotionEstimator();
+        const setup = phoneSetupRef.current;
+        setCalibration(calibrator.configure(activeStream
+          ? { id: setup.ids.station, size: setup.stationSize, height: setup.mounts.station.height }
+          : { id: MARKERS.station.id, size: MARKERS.station.size, height: MARKER_MOUNTS.station.height }));
+        setVision({ markers: [], ms: 0, at: 0, metric: null, motion: { state: 'not-tracked', direction: null } });
       }
-      if (world.time >= nextTelemetry || nextTelemetry - world.time > 1 / TELEMETRY_HZ) { // 1 Hz on the simulation clock (re-arms after reset)
+      const elapsed = Math.min(0.25, (now - last) / 1000);
+      last = now;
+      if (!activeStream) {
+        carry = controller.advance(elapsed + carry, stepSeconds);
+        sim?.sync(world);
+        sim?.render();
+      }
+      const t = activeStream ? now / 1000 : world.time;
+      const phoneReady = activeStream && video.readyState >= 2 && video.videoWidth > 0;
+      const fresh = phoneReady && (video.getVideoPlaybackQuality?.().totalVideoFrames ?? video.currentTime) !== lastVideoTime;
+      if (fresh) { lastVideoTime = video.getVideoPlaybackQuality?.().totalVideoFrames ?? video.currentTime; lastPhoneFrameAt = now; }
+      // A stalled phone produces no repeated observations masquerading as live tracking.
+      if (activeStream && now - lastPhoneFrameAt > 1000 && now - lastDetectedAt > 1000) {
+        lastDetectedAt = now;
+        setVision({ markers: [], ms: 0, at: t, metric: null, motion: { state: 'not-tracked', direction: null } });
+      }
+      if (!inFlight && now - lastDetect >= 1000 / DETECTION_HZ &&
+        (activeStream ? fresh && !phoneSetupError(phoneSetupRef.current) : sim)) {
+        lastDetect = now;
+        grab.width = width; grab.height = height;
+        grabCtx.drawImage(activeStream ? video : sim.renderer.domElement, 0, 0, width, height);
+        const image = grabCtx.getImageData(0, 0, width, height);
+        postedSeqRef.current = ++seq;
+        operatorAtGrab = activeStream
+          ? (latestPacketRef.current && t - latestPacketRef.current.simTime <= 2 ? latestPacketRef.current.operatorActive : undefined)
+          : controller.operatorActive();
+        inFlight = true;
+        worker.postMessage({ image, family: activeStream ? phoneSetupRef.current.family : MARKER_FAMILY,
+          minPerimeterFraction: 0.03, simTime: t, seq }, [image.data.buffer]);
+      }
+      if (!activeStream && (world.time >= nextTelemetry || nextTelemetry - world.time > 1 / TELEMETRY_HZ)) {
         nextTelemetry = world.time + 1 / TELEMETRY_HZ;
-        if (!dropoutRef.current) { // "Simulate telemetry dropout" withholds packets, like a lost Wi-Fi link
+        if (!dropoutRef.current) {
           const packet = telemetryPacket(world, (Math.random() - 0.5) * 0.2);
-          latestPacketRef.current = { ...packet, mode: controller.dock.state, simTime: world.time }; // the robot also reports its docking mode
+          latestPacketRef.current = { ...packet, mode: controller.dock.state, simTime: world.time };
           setTelemetry(latestPacketRef.current);
           runRef.current?.addPacket(world.time, packet);
         }
       }
-      const reason = runRef.current?.autoEnd(world.time);
+      const reason = runRef.current?.autoEnd(t);
       if (reason) endRunRef.current(reason);
       if (now - rate.wall >= 1000) {
         rate = { wall: now, sim: world.time, value: Math.max(0, (world.time - rate.sim) / ((now - rate.wall) / 1000)) };
       }
       if (now - lastHud >= 100) {
         lastHud = now;
-        setTruth({ ...snapshot(controller), simSpeed: rate.value });
+        if (!activeStream) setTruth({ ...snapshot(controller), simSpeed: rate.value });
         const lastPacket = latestPacketRef.current;
-        setHud({ run: runRef.current?.progress(world.time) ?? null, linkSilenceS: lastPacket ? Math.max(0, world.time - lastPacket.simTime) : null });
+        setHud({ run: runRef.current?.progress(t) ?? null, linkSilenceS: lastPacket ? Math.max(0, t - lastPacket.simTime) : null });
       }
       frame = requestAnimationFrame(loop);
     }
     frame = requestAnimationFrame(loop);
-    return () => { cancelAnimationFrame(frame); worker.terminate(); sim.dispose(); sceneRef.current = null; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- scene is created once; preset changes are applied separately
+    return () => { disposed = true; closeTelemetry(); cancelAnimationFrame(frame); worker.terminate(); sim?.dispose(); sceneRef.current = null; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one pipeline; live settings and source are read through refs
   }, []);
 
   const byRole = Object.fromEntries(vision.markers.filter((m) => m.role).map((m) => [m.role, m]));
   const metric = vision.metric;
   const running = runTask !== null;
-  const notReadyReason = calibration.state === 'ready' ? '' : calibration.state === 'moved' ? 'Recalibrate first: the station marker moved.' : 'Waiting for the camera calibration.';
+  const setupError = phoneActive ? phoneSetupError(phoneSetup) : '';
+  const ready = calibration.state === 'ready' && !detectorError && !setupError && (!phoneActive || Boolean(metric?.robot));
+  const notReadyReason = detectorError || setupError || (phoneActive && calibration.state === 'ready' && !metric?.robot ? 'Waiting for the robot marker in live video.' : '') || (calibration.state === 'ready' ? '' : calibration.state === 'moved' ? 'Recalibrate first: the station marker moved.' : 'Waiting for the camera calibration.');
   const truthStation = useMemo(() => {
     const local = toStationFrame(truth.station, truth.x, truth.y);
     return { u: local.u, w: local.w, heading: wrapAngle((truth.heading * Math.PI) / 180 - truth.station.heading) };
   }, [truth]);
   const driveLabel = truth.drive > 0 ? 'forward' : truth.drive < 0 ? 'backward' : 'stopped';
+  const dashboard = {
+    type: 'dashboard', source: phoneActive ? 'phone' : 'simulator', size: frameSize,
+    setup: phoneSetup, setupRevision: setupRevisionRef.current,
+    markers: vision.markers, trackingFresh: Boolean(vision.fresh), detectorMs: vision.ms,
+    calibration, metric, motion: vision.motion, telemetry, linkSilenceS: hud.linkSilenceS,
+    ready, notReadyReason, run: running ? hud.run ?? { elapsedS: 0, displacementM: null, stillForS: null } : null,
+    runTask, lastResult: summarizePhoneResult(results[0]),
+  };
+  const handlePhoneControl = (raw) => {
+    const message = readPhoneControl(raw);
+    if (!message) return { ok: false, error: 'Invalid phone control. Refresh both pages and try again.' };
+    if (!phoneActive || !phoneStreamRef.current) return { ok: false, error: 'Wait for the live phone connection.' };
+    const busy = Boolean(runRef.current);
+    if (message.action === 'end') {
+      if (!busy) return { ok: false, error: 'No test is running.' };
+      endRunRef.current('user');
+    } else if (busy) return { ok: false, error: 'End the test before changing setup or calibration.' };
+    else if (message.action === 'setup') {
+      if (message.revision !== setupRevisionRef.current) return { ok: false, error: 'Setup changed on the laptop. Review the current settings and try again.' };
+      setPhoneSetup(message.setup);
+    } else if (message.action === 'recalibrate') recalibrate();
+    else if (message.action === 'start') {
+      if (!ready || resetPendingRef.current) return { ok: false, error: notReadyReason || 'Wait for calibration and current robot tracking.' };
+      startRun(message.task);
+      if (!runRef.current) return { ok: false, error: 'Camera setup changed. Wait for calibration before starting.' };
+    }
+    return { ok: true };
+  };
 
   return (
     <main className="min-h-dvh bg-slate-950 p-3 text-slate-100 md:p-5">
       <header className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <div>
-          <h1 className="text-lg font-bold">3D robot simulator</h1>
-          <p className="text-xs text-slate-400">A virtual phone camera watches the arena; ArUco detection runs on the rendered pixels only.</p>
+          <h1 className="text-lg font-bold">{phoneActive ? 'Phone camera evaluation' : '3D robot simulator'}</h1>
+          <p className="text-xs text-slate-400">{phoneActive ? 'Live phone video · marker detection, calibration and tests use the phone camera.' : 'Connect a phone below to replace the simulation with live camera evaluation.'}</p>
         </div>
         <nav className="flex gap-3 text-xs text-cyan-400">
           <a href="/">Live camera app</a><a href="/?scene=playground">2D playground</a>
@@ -244,22 +370,28 @@ export default function Simulator3D() {
 
       <div className="flex flex-col gap-4 xl:flex-row">
         <section className="min-w-0 flex-1">
-          <div ref={viewRef} className="relative w-full overflow-hidden rounded-lg border border-slate-800 bg-black" style={{ aspectRatio: `${RENDER_WIDTH} / ${RENDER_HEIGHT}` }}>
-            <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" aria-label="Simulated phone camera view" />
-            <DetectionOverlay markers={vision.markers} unit={unit} />
-            {error && <p className="absolute inset-0 grid place-items-center p-4 text-center text-sm text-red-300">{error}</p>}
+          <div ref={viewRef} className="relative w-full overflow-hidden rounded-lg border border-slate-800 bg-black" style={{ aspectRatio: `${frameSize.width} / ${frameSize.height}`, maxWidth: phoneActive ? `${75 * frameSize.width / frameSize.height}svh` : undefined, marginInline: 'auto' }}>
+            <canvas ref={canvasRef} className={`absolute inset-0 h-full w-full ${phoneActive ? 'hidden' : ''}`} aria-label="Simulated phone camera view" />
+            <video ref={phoneVideoRef} autoPlay muted playsInline className={`absolute inset-0 h-full w-full object-contain ${phoneActive ? '' : 'hidden'}`} aria-label="Live phone camera with marker detection" />
+            <DetectionOverlay markers={vision.markers} unit={unit} width={frameSize.width} height={frameSize.height} />
+            <p className="absolute left-2 top-2 z-20 rounded bg-slate-950/90 px-2 py-1 text-xs text-cyan-300" role="status">
+              {phoneActive ? 'Live phone' : 'Simulator'} · {vision.markers.length} markers detected
+            </p>
+            {detectorError && <p role="alert" className="absolute inset-x-0 bottom-0 z-20 bg-slate-950/90 p-3 text-sm text-red-300">{detectorError}</p>}
+            {error && !phoneActive && <p className="absolute inset-0 grid place-items-center p-4 text-center text-sm text-red-300">{error}</p>}
           </div>
 
           <LiveStatusBar motion={vision.motion} telemetry={telemetry} linkSilenceS={hud.linkSilenceS} run={running ? hud.run : null} />
-          <Controls mode={mode} command={controller.command} driveLabel={driveLabel} />
-          <PhoneCameraDebug sourceRef={canvasRef} sourceError={error} />
+          {!phoneActive && <Controls mode={mode} command={controller.command} driveLabel={driveLabel} />}
+          <PhoneCameraDebug sourceRef={canvasRef} sourceError={error} onStreamChange={onPhoneStream} dashboard={dashboard} onControl={handlePhoneControl} />
         </section>
 
         <aside className="flex w-full flex-col gap-3 text-xs xl:w-96">
-          <EvaluationPanel ready={calibration.state === 'ready'} notReadyReason={notReadyReason} run={running ? hud.run ?? { elapsedS: 0, displacementM: null, stillForS: null } : null}
+          <EvaluationPanel ready={ready} live={phoneActive} notReadyReason={notReadyReason} run={running ? hud.run ?? { elapsedS: 0, displacementM: null, stillForS: null } : null}
             runTask={runTask} onStart={startRun} onEnd={() => endRunRef.current('user')} results={results} />
 
-          <Panel title="Setup">
+          {phoneActive && <PhoneVisionSetup setup={phoneSetup} onChange={setPhoneSetup} locked={running} markers={vision.markers} error={setupError} />}
+          {!phoneActive && <Panel title="Setup">
             <label className="mb-2 block">Phone camera
               <select disabled={running} className="mt-1 w-full rounded border border-slate-700 bg-slate-950 p-2 disabled:opacity-50" value={preset}
                 onChange={(e) => { setPreset(e.target.value); setCalSettings({ preset: e.target.value }); e.target.blur(); }}>
@@ -281,7 +413,7 @@ export default function Simulator3D() {
             </div>
             <button disabled={running} className="rounded bg-slate-700 px-3 py-2 font-semibold hover:bg-slate-600 disabled:opacity-50" onClick={(e) => { resetRobot(); e.currentTarget.blur(); }}>Reset robot</button>
             {running && <span className="ml-2 text-slate-500">Camera and reset are locked during a test.</span>}
-          </Panel>
+          </Panel>}
 
           <Panel title={`Camera detections (${fmt(vision.ms, 0)} ms)`}>
             <table className="w-full">
@@ -291,22 +423,23 @@ export default function Simulator3D() {
                   const m = byRole[role];
                   return <tr key={role}>
                     <td style={{ color: ROLE_COLOURS[role] }}>{ROLE_LABELS[role]}</td>
-                    <td className="text-center">{MARKERS[role].id}</td>
+                    <td className="text-center">{phoneActive ? phoneSetup.ids[role] : MARKERS[role].id}</td>
                     <td className="text-center">{m ? `${fmt(m.centre.x, 0)}, ${fmt(m.centre.y, 0)}` : <span className="text-amber-400">not detected</span>}</td>
                     <td className="text-center">{m ? `${fmt(m.heading, 0)}°` : '—'}</td>
                   </tr>;
                 })}
               </tbody>
             </table>
-            <p className="mt-2 text-slate-500">DICT_5X5_100 · image pixels; metric values are in the calibration panel.</p>
+            <p className="mt-2 text-slate-500">{phoneActive ? phoneSetup.family : '5x5_100'} · image pixels; metric values are in the calibration panel.</p>
           </Panel>
 
           <CalibrationPanel locked={running} calibration={calibration} settings={calSettings} onSettings={setCalSettings} onRecalibrate={recalibrate}
-            metric={metric} truthStation={truthStation} />
+            metric={metric} truthStation={phoneActive ? null : truthStation} phoneSetup={phoneActive ? phoneSetup : null} />
 
-          <DockingPanel truth={truth} />
+          {!phoneActive && <DockingPanel truth={truth} />}
 
-          <Panel title="Robot telemetry (1 Hz, ESP32 packet format)">
+          <Panel title={phoneActive ? 'Robot telemetry (external WebSocket)' : 'Robot telemetry (1 Hz, ESP32 packet format)'}>
+            {phoneActive && <p className="mb-2 text-slate-400">Connect the robot telemetry service to /ws (or VITE_WS_URL). Simulator packets are disabled. Missing tilt, charging or medicine-marker evidence appears in the test result. Physical drive commands come from your robot/glove.</p>}
             {telemetry ? <dl className="grid grid-cols-3 gap-2">
               <Stat label="Tilt" value={`${fmt(telemetry.tilt, 1)}°`} />
               <Stat label="Battery" value={`${fmt(telemetry.battery, 2)} V`} />
@@ -314,7 +447,7 @@ export default function Simulator3D() {
             </dl> : <p className="text-slate-500">Waiting for first packet…</p>}
           </Panel>
 
-          <Panel title="Ground truth (simulator only — not visible to the app)">
+          {!phoneActive && <Panel title="Ground truth (simulator only — not visible to the app)">
             <dl className="grid grid-cols-3 gap-2">
               <Stat label="x, y" value={`${fmt(truth.x)}, ${fmt(truth.y)} m`} />
               <Stat label="Heading" value={`${fmt(truth.heading, 1)}°`} />
@@ -329,53 +462,10 @@ export default function Simulator3D() {
               <Stat label="Sim speed" value={`${fmt(truth.simSpeed, 2)}×`} tone={truth.simSpeed < 0.9 ? 'text-amber-400' : ''} />
             </dl>
             <MiniMap truth={truth} measured={metric?.robot ?? null} />
-          </Panel>
+          </Panel>}
         </aside>
       </div>
     </main>
-  );
-}
-
-/** Image pixels per on-screen pixel of the camera view, so overlay text keeps a fixed on-screen size. */
-function useImagePixelsPerScreenPixel(ref) {
-  const [unit, setUnit] = useState(2);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return undefined;
-    const update = () => { if (el.clientWidth > 0) setUnit(RENDER_WIDTH / el.clientWidth); };
-    update();
-    const observer = new ResizeObserver(update);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [ref]);
-  return unit;
-}
-
-// On-screen sizes (CSS px) of the overlay; multiplied by `unit` to get image pixels.
-const OVERLAY = { axis: 11, minAxis: 18, maxAxis: 60 };
-
-/** Outlines (coloured by role) and +X/+Y frames for the detected markers, in image pixels. */
-function DetectionOverlay({ markers, unit }) {
-  const items = markers.map((m, i) => {
-    const c = m.corners;
-    const side = c.reduce((sum, p, k) => sum + Math.hypot(c[(k + 1) % 4].x - p.x, c[(k + 1) % 4].y - p.y), 0) / 4;
-    // Axes scale with the marker so neighbouring markers' frames do not run into each other.
-    return { m, key: `${m.id}-${i}`, axisLength: Math.max(OVERLAY.minAxis * unit, Math.min(OVERLAY.maxAxis * unit, side * 0.8)) };
-  });
-
-  return (
-    <svg className="pointer-events-none absolute inset-0 h-full w-full" viewBox={`0 0 ${RENDER_WIDTH} ${RENDER_HEIGHT}`} aria-hidden="true">
-      <defs>
-        <marker id="marker-x-arrow" markerWidth="4" markerHeight="4" refX="3" refY="2" orient="auto"><path d="M0,0 L4,2 L0,4 z" fill="#dc2626" /></marker>
-        <marker id="marker-y-arrow" markerWidth="4" markerHeight="4" refX="3" refY="2" orient="auto"><path d="M0,0 L4,2 L0,4 z" fill="#16a34a" /></marker>
-      </defs>
-      {items.map(({ m, key, axisLength }) => (
-        <g key={key}>
-          <polygon points={m.corners.map((p) => `${p.x},${p.y}`).join(' ')} fill="none" stroke={ROLE_COLOURS[m.role] ?? '#facc15'} strokeWidth={2 * unit} strokeLinejoin="round" />
-          <MarkerAxes corners={m.corners} length={axisLength} unit={unit} fontSize={OVERLAY.axis} strokeWidth={2.5} />
-        </g>
-      ))}
-    </svg>
   );
 }
 
@@ -442,12 +532,12 @@ const STATE_TEXT = {
 };
 
 /** Metric calibration status/settings plus the camera's metric measurements in the station frame. */
-function CalibrationPanel({ locked, calibration, settings, onSettings, onRecalibrate, metric, truthStation }) {
+function CalibrationPanel({ locked, calibration, settings, onSettings, onRecalibrate, metric, truthStation, phoneSetup }) {
   const { state, cal } = calibration;
   const [text, tone] = STATE_TEXT[state];
   const robot = metric?.robot, medicine = metric?.medicine;
-  const posErr = robot ? Math.hypot(robot.u - truthStation.u, robot.w - truthStation.w) : null;
-  const headErr = robot ? Math.abs(wrapAngle(robot.heading - truthStation.heading)) : null;
+  const posErr = robot && truthStation ? Math.hypot(robot.u - truthStation.u, robot.w - truthStation.w) : null;
+  const headErr = robot && truthStation ? Math.abs(wrapAngle(robot.heading - truthStation.heading)) : null;
   return (
     <Panel title="Metric calibration (station marker)">
       <p className={`mb-2 font-semibold ${tone}`}>
@@ -455,11 +545,14 @@ function CalibrationPanel({ locked, calibration, settings, onSettings, onRecalib
         {state === 'failed' && <span className="block font-normal text-red-300">{calibration.reason}</span>}
       </p>
       <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1">
+        {!phoneSetup && <>
         <label><input type="checkbox" disabled={locked} checked={settings.useGravity} onChange={(e) => onSettings({ useGravity: e.target.checked })} /> Phone tilt from accelerometer</label>
         <label><input type="checkbox" disabled={locked} checked={settings.estimateFocal} onChange={(e) => onSettings({ estimateFocal: e.target.checked })} /> Estimate focal length</label>
+        </>}
         <button disabled={locked} className="rounded bg-slate-700 px-2 py-1 font-semibold hover:bg-slate-600 disabled:opacity-50" onClick={(e) => { onRecalibrate(); e.currentTarget.blur(); }}>Recalibrate</button>
       </div>
-      {!settings.useGravity && <p className="mb-2 text-amber-300">Without the accelerometer the camera tilt comes from one small marker and can be off by tens of centimetres.</p>}
+      {!phoneSetup && !settings.useGravity && <p className="mb-2 text-amber-300">Without the accelerometer the camera tilt comes from one small marker and can be off by tens of centimetres.</p>}
+      {phoneSetup && <p className="mb-2 text-slate-400">Keep the phone fixed. Place markers flat and horizontal; station +X points out of the dock and robot +X points forward. Camera tilt is solved from the station marker. Focal length: {phoneSetup.estimateFocal ? 'estimated from an oblique view' : 'entered in setup'}.</p>}
       {cal && <dl className="mb-2 grid grid-cols-3 gap-2">
         <Stat label="Camera height" value={`${fmt(cal.cameraHeight)} m`} />
         <Stat label="Camera tilt" value={`${fmt(cal.depressionDeg, 1)}° down`} />
@@ -476,13 +569,13 @@ function CalibrationPanel({ locked, calibration, settings, onSettings, onRecalib
           <Stat label="To contact face" value={`${fmt(robot.faceDistance)} m`} />
           <Stat label="Front gap" value={`${fmt(robot.frontGap * 100, 1)} cm`} />
           <Stat label="Lateral / angle" value={`${fmt(robot.w * 100, 0)} cm / ${fmt(deg(robot.headingError), 0)}°`} />
-          <Stat label={`Approach region (${fmt(APPROACH_RADIUS)} m)`} value={robot.inApproach ? 'inside' : 'outside'} tone={robot.inApproach ? 'text-emerald-400' : ''} />
+          <Stat label={`Approach region (${fmt(phoneSetup ? 0.3 + phoneSetup.stationDepth / 2 : APPROACH_RADIUS)} m)`} value={robot.inApproach ? 'inside' : 'outside'} tone={robot.inApproach ? 'text-emerald-400' : ''} />
           <Stat label="Medicine box" value={medicine ? (medicine.onRobot === null ? 'seen' : medicine.onRobot ? 'on robot' : 'off robot') : 'not seen'}
             tone={medicine?.onRobot === false ? 'text-red-400' : ''} />
-          <Stat label="Error vs truth" value={`${fmt(posErr * 100, 1)} cm / ${fmt(deg(headErr), 1)}°`} tone={posErr > 0.05 ? 'text-amber-400' : 'text-slate-400'} />
+          {truthStation && <Stat label="Error vs truth" value={`${fmt(posErr * 100, 1)} cm / ${fmt(deg(headErr), 1)}°`} tone={posErr > 0.05 ? 'text-amber-400' : 'text-slate-400'} />}
         </dl> : <p className="text-amber-400">Robot marker not detected.</p>}
       </>}
-      <p className="mt-2 text-slate-500">Station frame: origin at the station centre, u out of the contact face, w to its left. The robot marker is measured on the plane {fmt(MARKER_MOUNTS.robot.height)} m above the floor.</p>
+      <p className="mt-2 text-slate-500">Station frame: origin at the station centre, u out of the contact face, w to its left. The robot marker is measured on the plane {fmt(phoneSetup ? phoneSetup.mounts.robot.height : MARKER_MOUNTS.robot.height)} m above the floor.</p>
     </Panel>
   );
 }
