@@ -22,6 +22,7 @@ import { defaultPhoneSetup, phoneSetupError, phoneIntrinsics, phoneGeometry, rea
 import PhoneVisionSetup from './PhoneVisionSetup';
 import { readPhoneControl, summarizePhoneResult } from '../utils/phoneDashboard';
 import { startFrameLoop } from '../utils/frameLoop';
+import { readTrackFrames } from '../utils/trackFrames';
 
 const ROLE_BY_ID = Object.fromEntries(Object.entries(MARKERS).map(([role, m]) => [m.id, role]));
 const deg = (rad) => (rad * 180) / Math.PI;
@@ -68,7 +69,7 @@ function measure(marker, roles = ROLE_BY_ID) {
 
 export default function Simulator3D() {
   const canvasRef = useRef(null);
-  const viewRef = useRef(null), phoneVideoRef = useRef(null), phoneStreamRef = useRef(null);
+  const viewRef = useRef(null), phoneVideoRef = useRef(null), phoneStreamRef = useRef(null), trackFramesRef = useRef(null);
   const [phoneActive, setPhoneActive] = useState(false);
   const [frameSize, setFrameSize] = useState({ width: RENDER_WIDTH, height: RENDER_HEIGHT });
   const unit = useImagePixelsPerScreenPixel(viewRef, frameSize.width);
@@ -82,6 +83,8 @@ export default function Simulator3D() {
   };
   const onPhoneStream = useCallback((stream) => {
     phoneStreamRef.current = stream;
+    trackFramesRef.current?.stop();
+    trackFramesRef.current = readTrackFrames(stream);
     const video = phoneVideoRef.current;
     if (video) {
       video.srcObject = stream;
@@ -248,9 +251,14 @@ export default function Simulator3D() {
 
     function loop(now) {
       const world = controller.world, stream = phoneStreamRef.current, video = phoneVideoRef.current;
+      // Prefer frames read straight from the track: they keep arriving while the tab is hidden.
+      const track = trackFramesRef.current?.stream === stream ? trackFramesRef.current : null;
+      const trackFrame = track?.frame ?? null;
+      const videoWidth = track ? trackFrame?.displayWidth ?? 0 : video.videoWidth;
+      const videoHeight = track ? trackFrame?.displayHeight ?? 0 : video.videoHeight;
       const sourceChanged = activeStream !== stream;
-      const nextWidth = stream ? video.videoWidth || width : RENDER_WIDTH;
-      const nextHeight = stream ? video.videoHeight || height : RENDER_HEIGHT;
+      const nextWidth = stream ? videoWidth || width : RENDER_WIDTH;
+      const nextHeight = stream ? videoHeight || height : RENDER_HEIGHT;
       const resized = nextWidth !== width || nextHeight !== height;
       if (sourceChanged || resized || resetPendingRef.current) {
         // Seal the old run before switching clocks. A run never mixes physical and simulated evidence.
@@ -284,9 +292,10 @@ export default function Simulator3D() {
         sim?.render();
       }
       const t = activeStream ? now / 1000 : world.time;
-      const phoneReady = activeStream && video.readyState >= 2 && video.videoWidth > 0;
-      const fresh = phoneReady && (video.getVideoPlaybackQuality?.().totalVideoFrames ?? video.currentTime) !== lastVideoTime;
-      if (fresh) { lastVideoTime = video.getVideoPlaybackQuality?.().totalVideoFrames ?? video.currentTime; lastPhoneFrameAt = now; }
+      const phoneReady = activeStream && (track ? Boolean(trackFrame) : video.readyState >= 2 && video.videoWidth > 0);
+      const frameMark = track ? track.count : video.getVideoPlaybackQuality?.().totalVideoFrames ?? video.currentTime;
+      const fresh = phoneReady && frameMark !== lastVideoTime;
+      if (fresh) { lastVideoTime = frameMark; lastPhoneFrameAt = now; }
       // A stalled phone produces no repeated observations masquerading as live tracking.
       if (activeStream && now - lastPhoneFrameAt > 1000 && now - lastDetectedAt > 1000) {
         lastDetectedAt = now;
@@ -296,7 +305,7 @@ export default function Simulator3D() {
         (activeStream ? fresh && !phoneSetupError(phoneSetupRef.current) : sim)) {
         lastDetect = now;
         grab.width = width; grab.height = height;
-        grabCtx.drawImage(activeStream ? video : sim.renderer.domElement, 0, 0, width, height);
+        grabCtx.drawImage(activeStream ? trackFrame ?? video : sim.renderer.domElement, 0, 0, width, height);
         const image = grabCtx.getImageData(0, 0, width, height);
         postedSeqRef.current = ++seq;
         operatorAtGrab = activeStream
@@ -329,7 +338,7 @@ export default function Simulator3D() {
     }
     // Live phone analysis keeps running when the laptop tab is hidden or covered, so the phone keeps its marker frames.
     const stopLoop = startFrameLoop(loop, { hiddenHz: DETECTION_HZ * 2, keepAlive: () => Boolean(phoneStreamRef.current) });
-    return () => { disposed = true; closeTelemetry(); stopLoop(); worker.terminate(); sim?.dispose(); sceneRef.current = null; };
+    return () => { disposed = true; closeTelemetry(); stopLoop(); trackFramesRef.current?.stop(); trackFramesRef.current = null; worker.terminate(); sim?.dispose(); sceneRef.current = null; };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- one pipeline; live settings and source are read through refs
   }, []);
 
