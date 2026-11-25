@@ -21,6 +21,7 @@ import { WS_URL } from '../config';
 import { defaultPhoneSetup, phoneSetupError, phoneIntrinsics, phoneGeometry, readPhysicalPacket } from '../utils/phoneVision';
 import PhoneVisionSetup from './PhoneVisionSetup';
 import { readPhoneControl, summarizePhoneResult } from '../utils/phoneDashboard';
+import { startFrameLoop } from '../utils/frameLoop';
 
 const ROLE_BY_ID = Object.fromEntries(Object.entries(MARKERS).map(([role, m]) => [m.id, role]));
 const deg = (rad) => (rad * 180) / Math.PI;
@@ -87,6 +88,22 @@ export default function Simulator3D() {
       if (stream) video.play().catch(() => {});
     }
   }, []);
+  // Keep the laptop screen awake during a phone session; a sleeping screen stops the analysis the phone shows.
+  useEffect(() => {
+    if (!phoneActive || !navigator.wakeLock) return undefined;
+    let lock = null, done = false;
+    const acquire = () => {
+      if (done || document.hidden || lock) return;
+      navigator.wakeLock.request('screen').then((next) => {
+        if (done) { next.release(); return; }
+        lock = next;
+        next.onrelease = () => { if (lock === next) lock = null; };
+      }).catch(() => {});
+    };
+    acquire();
+    document.addEventListener('visibilitychange', acquire);
+    return () => { done = true; document.removeEventListener('visibilitychange', acquire); lock?.release(); };
+  }, [phoneActive]);
   const [controller] = useState(createSimController);
   useEffect(() => { if (import.meta.env.DEV) window.__sim = controller; }, [controller]); // dev-only hook for scripted checks
   const sceneRef = useRef(null);
@@ -226,7 +243,7 @@ export default function Simulator3D() {
     const grab = document.createElement('canvas');
     const grabCtx = grab.getContext('2d', { willReadFrequently: true });
     const stepSeconds = 1 / PHYSICS_HZ;
-    let frame, last = performance.now(), carry = 0, lastDetect = -Infinity, lastHud = -Infinity, nextTelemetry = 0;
+    let last = performance.now(), carry = 0, lastDetect = -Infinity, lastHud = -Infinity, nextTelemetry = 0;
     let rate = { wall: performance.now(), sim: controller.world.time, value: 1 };
 
     function loop(now) {
@@ -309,10 +326,10 @@ export default function Simulator3D() {
         const lastPacket = latestPacketRef.current;
         setHud({ run: runRef.current?.progress(t) ?? null, linkSilenceS: lastPacket ? Math.max(0, t - lastPacket.simTime) : null });
       }
-      frame = requestAnimationFrame(loop);
     }
-    frame = requestAnimationFrame(loop);
-    return () => { disposed = true; closeTelemetry(); cancelAnimationFrame(frame); worker.terminate(); sim?.dispose(); sceneRef.current = null; };
+    // Live phone analysis keeps running when the laptop tab is hidden or covered, so the phone keeps its marker frames.
+    const stopLoop = startFrameLoop(loop, { hiddenHz: DETECTION_HZ * 2, keepAlive: () => Boolean(phoneStreamRef.current) });
+    return () => { disposed = true; closeTelemetry(); stopLoop(); worker.terminate(); sim?.dispose(); sceneRef.current = null; };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- one pipeline; live settings and source are read through refs
   }, []);
 
